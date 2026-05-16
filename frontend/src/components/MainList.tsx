@@ -26,6 +26,7 @@ interface MainListProps {
   focusedId: string | null;
   onToggleSelect: (id: string) => void;
   onFocus: (id: string) => void;
+  scopeKey: string;
   searchQuery: string;
   onSearchChange: (q: string) => void;
   currentFilterText: string;
@@ -201,6 +202,7 @@ export function MainList({
   focusedId, 
   onToggleSelect, 
   onFocus,
+  scopeKey,
   searchQuery,
   onSearchChange,
   currentFilterText,
@@ -239,6 +241,7 @@ export function MainList({
 }: MainListProps) {
   const { t } = useI18n();
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const previousScopeKeyRef = useRef(scopeKey);
   const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; projectPath: string | null } | null>(null);
   const activitySummaryGeneratedAt = activitySummary
@@ -358,6 +361,13 @@ export function MainList({
       setSelectedProjectPath(null);
     }
   }, [projects, selectedProjectPath]);
+
+  useEffect(() => {
+    if (previousScopeKeyRef.current === scopeKey) return;
+    previousScopeKeyRef.current = scopeKey;
+    setSelectedProjectPath(null);
+    setContextMenu(null);
+  }, [scopeKey]);
 
   useEffect(() => {
     const closeContextMenu = () => setContextMenu(null);

@@ -500,6 +500,7 @@ export default function App() {
   const projectPathTitle = selectedProjectPath
     ? selectedProjectPath.split('/').filter(Boolean).slice(-2).join('/') || selectedProjectPath
     : '';
+  const explorerScopeKey = `${currentFilter}\u001f${selectedLabelFilters.join('\u001f')}`;
 
   // Human readable title for the main list
   const filterTitle = selectedLabel
@@ -532,6 +533,7 @@ export default function App() {
             focusedId={focusedId}
             onToggleSelect={handleToggleSelect}
             onFocus={setFocusedId}
+            scopeKey={explorerScopeKey}
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
             currentFilterText={filterTitle}
