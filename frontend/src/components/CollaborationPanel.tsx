@@ -125,12 +125,24 @@ export function CollaborationPanel({
   const peers = state?.store.trustedPeers ?? [];
   const discoveredPeers = state?.discoveredPeers ?? [];
   const summaries = state?.store.summaries ?? [];
-  const activeSummary = latestSummary ?? summaries[summaries.length - 1] ?? null;
   const localConfig = state?.localConfig;
   const selectedPeer = peers.find((peer) => peer.peerId === selectedPeerId) ?? null;
   const selectedDetailProject = selectedDetailProjectId
     ? peerProjects.find((project) => project.projectId === selectedDetailProjectId) ?? null
     : null;
+  const activeSummaryProjectId = selectedDetailProjectId ?? selectedProjectId;
+  const activeSummary = useMemo(() => {
+    if (!activeSummaryProjectId) return null;
+
+    return [latestSummary, ...summaries]
+      .filter((summary): summary is CollaborationSummary => Boolean(summary))
+      .filter(
+        (summary) =>
+          summary.projectId === activeSummaryProjectId &&
+          (!selectedPeerId || summary.sourceIds.includes(selectedPeerId))
+      )
+      .sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime())[0] ?? null;
+  }, [activeSummaryProjectId, latestSummary, selectedPeerId, summaries]);
   const activeSubscription = state?.store.subscriptions.find(
     (subscription) =>
       subscription.peerId === selectedPeerId &&

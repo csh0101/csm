@@ -822,11 +822,37 @@ fn policy_for_session<'a>(
     policies.iter().find(|policy| {
         policy.enabled
             && policy.project_id == project_id
-            && policy
-                .project_path
-                .as_deref()
-                .is_none_or(|project_path| session.project_path.as_deref() == Some(project_path))
+            && policy.project_path.as_deref().is_none_or(|project_path| {
+                project_path_matches_policy(session.project_path.as_deref(), project_path)
+            })
     })
+}
+
+fn project_path_matches_policy(
+    session_project_path: Option<&str>,
+    policy_project_path: &str,
+) -> bool {
+    let Some(session_project_path) = session_project_path else {
+        return false;
+    };
+    let session_path = normalize_path_for_policy_match(session_project_path);
+    let policy_path = normalize_path_for_policy_match(policy_project_path);
+
+    if policy_path == "/" {
+        return session_path.starts_with('/');
+    }
+
+    session_path == policy_path || session_path.starts_with(&format!("{policy_path}/"))
+}
+
+fn normalize_path_for_policy_match(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() && normalized.starts_with('/') {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn session_is_shareable(session: &Session, policy: &SharePolicy) -> bool {
@@ -1318,6 +1344,37 @@ mod tests {
             1
         );
         assert!(visible_project_sessions([&session].into_iter(), &[]).is_empty());
+    }
+
+    #[test]
+    fn share_policy_path_allows_child_project_paths() {
+        let session = Session {
+            id: "id".to_string(),
+            codex_session_id: Some("codex".to_string()),
+            name: "session".to_string(),
+            excerpt: "excerpt".to_string(),
+            full_content: "content".to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            project_path: Some("/work/project/packages/api".to_string()),
+            labels: vec!["share".to_string()],
+            last_modified: Utc::now(),
+            size: 1,
+            status: crate::models::SessionStatus::Active,
+            notes: String::new(),
+        };
+        let identity = project_identity_for_path(session.project_path.as_deref());
+        let mut policy = default_share_policy(
+            identity.project_id.clone(),
+            Some("/work/project".to_string()),
+        );
+
+        assert_eq!(
+            visible_project_sessions([&session].into_iter(), &[policy.clone()]).len(),
+            1
+        );
+
+        policy.project_path = Some("/work/project-other".to_string());
+        assert!(visible_project_sessions([&session].into_iter(), &[policy]).is_empty());
     }
 
     #[test]
