@@ -25,6 +25,7 @@ impl Drop for LanDiscoveryHandle {
 pub fn start(
     state: SharedState,
     local_peer_id: String,
+    local_display_name: String,
 ) -> Result<Option<LanDiscoveryHandle>, AppError> {
     if !state.config.lan_discovery_enabled {
         return Ok(None);
@@ -35,7 +36,8 @@ pub fn start(
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|error| AppError::External(format!("failed to browse LAN peers: {error}")))?;
-    let service_fullname = register_local_presence(&daemon, &state, &local_peer_id)?;
+    let service_fullname =
+        register_local_presence(&daemon, &state, &local_peer_id, local_display_name)?;
     let runtime = Handle::current();
     thread::Builder::new()
         .name("csm-mdns-discovery".to_string())
@@ -84,8 +86,8 @@ fn register_local_presence(
     daemon: &ServiceDaemon,
     state: &SharedState,
     peer_id: &str,
+    display_name: String,
 ) -> Result<String, AppError> {
-    let display_name = state.config.peer_display_name.clone();
     let instance_name = sanitize_instance_name(&display_name);
     let host_name = format!("{peer_id}.local.");
     let properties = HashMap::from([

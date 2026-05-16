@@ -27,7 +27,7 @@ The backend listens on `http://127.0.0.1:4000` by default. Useful environment va
 - `CSM_STALE_AFTER_DAYS` - initial default for days since last modification before a session is considered stale, default `15`. The UI can update this value online and persists it in metadata.
 - `CSM_CODEX_BIN` - optional path to the `codex` CLI used by AI activity summaries. If unset, the app searches `PATH`, common local install paths, and NVM node versions.
 - `CSM_PEER_TOKEN` - required token for LAN peer read APIs. Peers must send it as `x-csm-peer-token` or `Authorization: Bearer`.
-- `CSM_LAN_DISCOVERY` - set to `true` to announce and discover LAN peers with mDNS. Discovery is off by default.
+- `CSM_LAN_DISCOVERY` - controls mDNS LAN peer announcements and discovery, default `true`. Set to `false` to disable broadcasting.
 - `CSM_PEER_DISPLAY_NAME` - optional display name advertised in LAN peer presence.
 
 Start the frontend:
@@ -48,7 +48,7 @@ npm run tauri:dev
 
 The desktop app reuses the React/Vite frontend. Session management calls Rust through Tauri commands; collaboration uses a local HTTP API started by the desktop shell so `/api/collaboration` and `/peer/*` behave the same as the standalone backend. By default, desktop metadata is stored in the platform app data directory, and the desktop shell reserves an available loopback port for its local API; set `CSM_DATA_DIR` to force the same metadata location as the standalone backend, or `CSM_BIND_ADDR` to force a specific collaboration API address.
 
-For LAN collaboration, set `CSM_PEER_TOKEN` before launching so the collaboration tab can show the token others must use. If other devices need to connect, set `CSM_BIND_ADDR` to a LAN-reachable bind address. Use a concrete LAN IP such as `192.168.1.12:4000` when you want the tab to show a directly shareable URL; `0.0.0.0:4000` listens on all interfaces, but peers must replace `0.0.0.0` with this machine's LAN IP.
+For LAN collaboration, set `CSM_PEER_TOKEN` before launching so the collaboration tab can show the token others must use. mDNS discovery broadcasts are enabled by default; set `CSM_LAN_DISCOVERY=false` only when you want to turn them off. If other devices need to connect, set `CSM_BIND_ADDR` to a LAN-reachable bind address. Use a concrete LAN IP such as `192.168.1.12:4000` when you want the tab to show a directly shareable URL; `0.0.0.0:4000` listens on all interfaces, but peers must replace `0.0.0.0` with this machine's LAN IP.
 
 Build the desktop app bundle:
 

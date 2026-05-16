@@ -142,6 +142,13 @@ export function fetchCollaborationState() {
   return requestJson<CollaborationStateResponse>('/api/collaboration');
 }
 
+export function updateLocalCollaborationConfig(payload: { displayName: string }) {
+  return requestJson<CollaborationStateResponse>('/api/collaboration/local-config', {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
 export function updateSharePolicy(
   projectId: string,
   payload: {

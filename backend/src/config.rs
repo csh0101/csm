@@ -35,7 +35,7 @@ impl Config {
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
-        let lan_discovery_enabled = env_flag("CSM_LAN_DISCOVERY", false);
+        let lan_discovery_enabled = env_flag("CSM_LAN_DISCOVERY", true);
         let peer_display_name = env::var("CSM_PEER_DISPLAY_NAME")
             .ok()
             .map(|name| name.trim().to_string())

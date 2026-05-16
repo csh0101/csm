@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     sync::{Arc, Mutex},
 };
 
@@ -36,9 +37,20 @@ impl AppState {
     pub fn new(config: Config) -> Result<SharedState, AppError> {
         let metadata = storage::load_metadata(&config.metadata_path)?;
         let mut collaboration = storage::load_collaboration_store(&config.collaboration_path)?;
+        let peer_display_name = env::var("CSM_PEER_DISPLAY_NAME")
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                collaboration
+                    .local_peer
+                    .as_ref()
+                    .map(|peer| peer.display_name.clone())
+            })
+            .unwrap_or_else(|| config.peer_display_name.clone());
         let local_peer = collaboration::ensure_local_peer(
             &mut collaboration,
-            config.peer_display_name.clone(),
+            peer_display_name,
             format!("http://{}", config.bind_addr),
         );
         storage::save_collaboration_store(&config.collaboration_path, &collaboration)?;
@@ -83,7 +95,9 @@ impl AppState {
             }),
         });
 
-        if let Some(discovery) = discovery::start(state.clone(), local_peer.peer_id)? {
+        if let Some(discovery) =
+            discovery::start(state.clone(), local_peer.peer_id, local_peer.display_name)?
+        {
             *state
                 .lan_discovery
                 .lock()

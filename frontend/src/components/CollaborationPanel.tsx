@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Check,
@@ -44,6 +44,7 @@ interface CollaborationPanelProps {
   isGenerating: boolean;
   isRefreshingIncremental: boolean;
   onRefresh: () => void;
+  onLocalDisplayNameChange: (value: string) => void | Promise<void>;
   onPairPeer: () => void;
   onUseDiscoveredPeer: (peer: PeerPresence) => void;
   onCreateSubscription: (projectId?: string) => void;
@@ -57,11 +58,12 @@ interface LocalConfigValueProps {
   label: string;
   value?: string | null;
   fallback?: string;
+  helper?: string;
   copied: boolean;
   onCopy?: () => void;
 }
 
-function LocalConfigValue({ label, value, fallback = '-', copied, onCopy }: LocalConfigValueProps) {
+function LocalConfigValue({ label, value, fallback = '-', helper, copied, onCopy }: LocalConfigValueProps) {
   const { t } = useI18n();
   const displayValue = value || fallback;
 
@@ -83,8 +85,25 @@ function LocalConfigValue({ label, value, fallback = '-', copied, onCopy }: Loca
           </button>
         )}
       </div>
+      {helper && <p className="mt-1 max-w-48 text-xs leading-4 text-slate-400">{helper}</p>}
     </div>
   );
+}
+
+function localPort(baseUrl?: string | null, bindAddress?: string | null) {
+  const candidates = [baseUrl, bindAddress].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    try {
+      const withScheme = candidate.includes('://') ? candidate : `http://${candidate}`;
+      const parsed = new URL(withScheme);
+      if (parsed.port) return parsed.port;
+    } catch {
+      const match = candidate.match(/:(\d+)$/);
+      if (match) return match[1];
+    }
+  }
+
+  return '';
 }
 
 export function CollaborationPanel({
@@ -107,6 +126,7 @@ export function CollaborationPanel({
   isGenerating,
   isRefreshingIncremental,
   onRefresh,
+  onLocalDisplayNameChange,
   onPairPeer,
   onUseDiscoveredPeer,
   onCreateSubscription,
@@ -122,10 +142,12 @@ export function CollaborationPanel({
   const [detailTab, setDetailTab] = useState<'config' | 'tasks'>('config');
   const [analysisPrompt, setAnalysisPrompt] = useState('');
   const [analysisCycle, setAnalysisCycle] = useState('1h');
+  const [localDisplayNameDraft, setLocalDisplayNameDraft] = useState('');
   const peers = state?.store.trustedPeers ?? [];
   const discoveredPeers = state?.discoveredPeers ?? [];
   const summaries = state?.store.summaries ?? [];
   const localConfig = state?.localConfig;
+  const port = localPort(localConfig?.baseUrl, localConfig?.bindAddress);
   const selectedPeer = peers.find((peer) => peer.peerId === selectedPeerId) ?? null;
   const selectedDetailProject = selectedDetailProjectId
     ? peerProjects.find((project) => project.projectId === selectedDetailProjectId) ?? null
@@ -156,6 +178,19 @@ export function CollaborationPanel({
     await navigator.clipboard.writeText(value);
     setCopiedLocalField(field);
     window.setTimeout(() => setCopiedLocalField((current) => (current === field ? null : current)), 1500);
+  };
+  useEffect(() => {
+    setLocalDisplayNameDraft(localConfig?.displayName ?? '');
+  }, [localConfig?.displayName]);
+
+  const commitLocalDisplayName = () => {
+    const trimmed = localDisplayNameDraft.trim();
+    if (!trimmed || trimmed === localConfig?.displayName) {
+      setLocalDisplayNameDraft(localConfig?.displayName ?? '');
+      return;
+    }
+
+    void onLocalDisplayNameChange(trimmed);
   };
   const peerCards = useMemo(
     () => [
@@ -225,34 +260,54 @@ export function CollaborationPanel({
             </div>
           )}
 
-          <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-center">
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                <LocalConfigValue
-                  label={t('collab_local_display_name')}
-                  value={localConfig?.displayName}
-                  copied={copiedLocalField === 'displayName'}
-                  onCopy={() => copyLocalConfigValue('displayName', localConfig?.displayName)}
+          <section className="mb-6 flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm md:flex-row md:items-center md:justify-between">
+            <div className="flex flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-start sm:gap-8">
+              <div className="min-w-0">
+                <label className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {t('collab_local_display_name')}
+                </label>
+                <input
+                  type="text"
+                  value={localDisplayNameDraft}
+                  onChange={(event) => setLocalDisplayNameDraft(event.target.value)}
+                  onBlur={commitLocalDisplayName}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.currentTarget.blur();
+                    }
+                    if (event.key === 'Escape') {
+                      setLocalDisplayNameDraft(localConfig?.displayName ?? '');
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  className="w-48 border-0 border-b border-dashed border-slate-300 bg-transparent pb-0.5 text-sm font-semibold text-slate-800 outline-none transition-colors focus:border-blue-500"
                 />
+              </div>
+              <div className="hidden h-8 w-px bg-slate-100 sm:block"></div>
+              <div className="w-28">
                 <LocalConfigValue
-                  label={t('collab_local_base_url')}
-                  value={localConfig?.baseUrl}
-                  copied={copiedLocalField === 'baseUrl'}
-                  onCopy={() => copyLocalConfigValue('baseUrl', localConfig?.baseUrl)}
+                  label={t('collab_local_port')}
+                  value={port}
+                  copied={copiedLocalField === 'port'}
+                  onCopy={() => copyLocalConfigValue('port', port)}
                 />
+              </div>
+              <div className="hidden h-8 w-px bg-slate-100 sm:block"></div>
+              <div className="w-64 max-w-full">
                 <LocalConfigValue
                   label={t('collab_local_token')}
                   value={localConfig?.peerToken}
                   fallback={t('collab_token_missing')}
+                  helper={localConfig?.peerToken ? t('collab_token_helper') : undefined}
                   copied={copiedLocalField === 'peerToken'}
                   onCopy={() => copyLocalConfigValue('peerToken', localConfig?.peerToken)}
                 />
               </div>
-              <span className="inline-flex w-fit items-center gap-2 rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-emerald-600">
-                <span className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]"></span>
-                {localConfig?.lanDiscoveryEnabled ? t('collab_discovering') : t('collab_disabled')}
-              </span>
             </div>
+            <span className="inline-flex w-fit items-center gap-2 rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-emerald-600">
+              <span className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]"></span>
+              {localConfig?.lanDiscoveryEnabled ? t('collab_discovering') : t('collab_disabled')}
+            </span>
           </section>
 
           <div className="grid grid-cols-1 items-start gap-6 md:grid-cols-[280px_1fr]">

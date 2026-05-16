@@ -30,6 +30,7 @@ import {
   pairPeer,
   restoreSession,
   scanSessions,
+  updateLocalCollaborationConfig,
   updateSharePolicy,
   updateSessionLabels,
   updateSessionNotes,
@@ -347,6 +348,20 @@ export default function App() {
     }
   };
 
+  const handleUpdateLocalDisplayName = async (displayName: string) => {
+    const trimmed = displayName.trim();
+    if (!trimmed) return;
+
+    setErrorMessage(null);
+    setNoticeMessage(null);
+    try {
+      const response = await updateLocalCollaborationConfig({ displayName: trimmed });
+      setCollaborationState(response);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+    }
+  };
+
   const handlePairPeer = async () => {
     if (!peerBaseUrl.trim()) return;
 
@@ -647,6 +662,7 @@ export default function App() {
           isGenerating={isGeneratingCollaboration}
           isRefreshingIncremental={isRefreshingCollaboration}
           onRefresh={loadCollaborationState}
+          onLocalDisplayNameChange={handleUpdateLocalDisplayName}
           onPairPeer={handlePairPeer}
           onUseDiscoveredPeer={handleUseDiscoveredPeer}
           onCreateSubscription={handleCreateCollaborationSubscription}

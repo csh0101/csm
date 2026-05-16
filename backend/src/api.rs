@@ -13,6 +13,7 @@ use crate::{
     archive,
     collaboration::{self, PeerDeltasQuery, PeerSessionsQuery},
     config::Config,
+    discovery,
     error::AppError,
     models::{
         ArchiveRecord, CollaborationSource, CollaborationSourceKind, CollaborationStore,
@@ -130,6 +131,12 @@ pub struct UpdateSharePolicyRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateLocalCollaborationConfigRequest {
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PairPeerRequest {
     pub peer_base_url: String,
     pub peer_access_token: Option<String>,
@@ -206,6 +213,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/summaries/activity", post(generate_activity_summary))
         .route("/api/collaboration", get(get_collaboration_state))
         .route(
+            "/api/collaboration/local-config",
+            patch(update_local_collaboration_config),
+        )
+        .route(
             "/api/collaboration/share-policies/{projectId}",
             patch(update_share_policy),
         )
@@ -263,6 +274,62 @@ async fn peer_health(State(state): State<SharedState>) -> Json<PeerHealthRespons
         display_name: peer.display_name,
         base_url: peer.base_url,
     })
+}
+
+async fn update_local_collaboration_config(
+    State(state): State<SharedState>,
+    Json(request): Json<UpdateLocalCollaborationConfigRequest>,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    let display_name = request.display_name.trim();
+    if display_name.is_empty() {
+        return Err(AppError::BadRequest(
+            "displayName must not be empty".to_string(),
+        ));
+    }
+
+    let display_name = display_name.chars().take(80).collect::<String>();
+    let peer = {
+        let mut inner = state.inner.write().await;
+        let base_url = format!("http://{}", state.config.bind_addr);
+        let peer = collaboration::ensure_local_peer(
+            &mut inner.collaboration,
+            display_name.clone(),
+            base_url,
+        );
+        storage::save_collaboration_store(&state.config.collaboration_path, &inner.collaboration)?;
+        peer
+    };
+
+    if state.config.lan_discovery_enabled {
+        {
+            let mut discovery = state
+                .lan_discovery
+                .lock()
+                .expect("LAN discovery lock poisoned");
+            let previous = discovery.take();
+            drop(discovery);
+            drop(previous);
+        }
+
+        if let Some(handle) = discovery::start(
+            state.clone(),
+            peer.peer_id.clone(),
+            peer.display_name.clone(),
+        )? {
+            *state
+                .lan_discovery
+                .lock()
+                .expect("LAN discovery lock poisoned") = Some(handle);
+        }
+    }
+
+    let inner = state.inner.read().await;
+    Ok(Json(collaboration_state_response(
+        &inner.collaboration,
+        &inner.sessions,
+        &inner.peer_presence,
+        &state.config,
+    )))
 }
 
 async fn peer_projects(
@@ -1750,6 +1817,61 @@ mod tests {
 
         let stored = storage::load_metadata(&metadata_path).expect("load saved metadata");
         assert_eq!(stored.stale_after_days, Some(30));
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn local_collaboration_config_update_persists_display_name() {
+        let temp_dir = unique_temp_dir("local-display-name");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let state = Arc::new(AppState {
+            config: Config {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+                data_dir: temp_dir.clone(),
+                metadata_path: temp_dir.join("metadata.json"),
+                collaboration_path: temp_dir.join("collaboration.json"),
+                peer_token: Some("token-1".to_string()),
+                lan_discovery_enabled: false,
+                peer_display_name: "Initial".to_string(),
+                archive_dir: temp_dir.join("archive"),
+                max_preview_bytes: 1024,
+                stale_after_days: 15,
+            },
+            lan_discovery: Mutex::new(None),
+            inner: RwLock::new(AppData {
+                metadata: MetadataFile::default(),
+                collaboration: CollaborationStore::default(),
+                peer_presence: HashMap::new(),
+                sessions: HashMap::new(),
+                workspace_path: None,
+                stale_after_days: 15,
+            }),
+        });
+
+        let response = update_local_collaboration_config(
+            State(state.clone()),
+            Json(UpdateLocalCollaborationConfigRequest {
+                display_name: "  Team Workstation  ".to_string(),
+            }),
+        )
+        .await
+        .expect("update local display name")
+        .0;
+
+        assert_eq!(response.local_config.display_name, "Team Workstation");
+        assert_eq!(response.local_config.peer_token.as_deref(), Some("token-1"));
+
+        let stored = storage::load_collaboration_store(&state.config.collaboration_path)
+            .expect("load collaboration store");
+        assert_eq!(
+            stored
+                .local_peer
+                .as_ref()
+                .expect("stored local peer")
+                .display_name,
+            "Team Workstation"
+        );
 
         fs::remove_dir_all(temp_dir).ok();
     }
