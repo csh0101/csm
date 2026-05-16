@@ -162,7 +162,9 @@ function findProjectIdentity(projects: ProjectIdentity[], projectPath: string | 
     return projects.find((project) => !project.rootPath);
   }
 
-  return projects.find((project) => project.rootPath && pathIsWithinRoot(projectPath, project.rootPath));
+  return projects
+    .filter((project) => project.rootPath && pathIsWithinRoot(projectPath, project.rootPath))
+    .sort((a, b) => (b.rootPath?.length ?? 0) - (a.rootPath?.length ?? 0))[0];
 }
 
 function SortHeader({
