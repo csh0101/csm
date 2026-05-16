@@ -384,9 +384,11 @@ export default function App() {
     await loadProjectsForPeer(peerId, collaborationState?.store.trustedPeers ?? []);
   };
 
-  const handleCreateCollaborationSubscription = async () => {
-    if (!collaborationProjectId || (!selectedPeerId && !peerBaseUrl.trim())) return;
+  const handleCreateCollaborationSubscription = async (projectId?: string) => {
+    const targetProjectId = projectId || collaborationProjectId;
+    if (!targetProjectId || (!selectedPeerId && !peerBaseUrl.trim())) return;
 
+    setCollaborationProjectId(targetProjectId);
     setIsGeneratingCollaboration(true);
     setErrorMessage(null);
     setNoticeMessage(null);
@@ -399,13 +401,14 @@ export default function App() {
         peerId: selectedPeerId || undefined,
         peerBaseUrl: selectedPeerId ? undefined : normalizedPeerBaseUrl,
         peerAccessToken: peerAccessToken.trim() || undefined,
-        projectId: collaborationProjectId,
+        projectId: targetProjectId,
         days: collaborationSummaryDays,
         language: lang,
       });
       setCollaborationState(response.state);
       setLatestCollaborationSummary(response.summary);
       setSelectedPeerId(response.subscription.peerId);
+      setCollaborationProjectId(response.subscription.projectId);
       setNoticeMessage(t('collab_subscription_created'));
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_summary_failed'));

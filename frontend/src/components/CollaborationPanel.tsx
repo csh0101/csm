@@ -46,7 +46,7 @@ interface CollaborationPanelProps {
   onRefresh: () => void;
   onPairPeer: () => void;
   onUseDiscoveredPeer: (peer: PeerPresence) => void;
-  onCreateSubscription: () => void;
+  onCreateSubscription: (projectId?: string) => void;
   onGenerateIncremental: () => void;
   latestSummary: CollaborationSummary | null;
   errorMessage?: string | null;
@@ -435,7 +435,7 @@ export function CollaborationPanel({
                           />
                           <button
                             type="button"
-                            onClick={onCreateSubscription}
+                            onClick={() => onCreateSubscription()}
                             disabled={!canSubscribe}
                             className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-bold text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
                           >
@@ -624,7 +624,7 @@ export function CollaborationPanel({
                                   if (isSubscribed) {
                                     openProjectDetail(project);
                                   } else {
-                                    onCreateSubscription();
+                                    onCreateSubscription(project.projectId);
                                   }
                                 }}
                                 disabled={!isSubscribed && isGenerating}
