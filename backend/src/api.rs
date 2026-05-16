@@ -146,6 +146,12 @@ pub struct PairPeerResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PeerProjectsRequest {
+    pub peer_access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSubscriptionRequest {
     pub peer_id: Option<String>,
     pub peer_base_url: Option<String>,
@@ -204,6 +210,10 @@ pub fn router(state: SharedState) -> Router {
             patch(update_share_policy),
         )
         .route("/api/collaboration/peers/pair", post(pair_peer))
+        .route(
+            "/api/collaboration/peers/{peerId}/projects",
+            post(trusted_peer_projects),
+        )
         .route(
             "/api/collaboration/subscriptions",
             post(create_subscription),
@@ -743,6 +753,31 @@ async fn pair_peer(
         peer,
         peer_projects,
     }))
+}
+
+async fn trusted_peer_projects(
+    Path(peer_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<PeerProjectsRequest>,
+) -> Result<Json<Vec<collaboration::PeerProject>>, AppError> {
+    let peer = {
+        let inner = state.inner.read().await;
+        inner
+            .collaboration
+            .trusted_peers
+            .iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("paired peer '{peer_id}' was not found")))?
+    };
+    let peer_base_url = peer
+        .base_url
+        .as_deref()
+        .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
+    let access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default());
+    let projects = fetch_peer_projects(peer_base_url, access_token.as_deref()).await?;
+
+    Ok(Json(projects))
 }
 
 async fn create_subscription(

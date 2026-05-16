@@ -9,6 +9,7 @@ import {
   CreateSubscriptionResponse,
   IncrementalSummaryResponse,
   PairPeerResponse,
+  PeerProject,
 } from './types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
@@ -184,6 +185,16 @@ export function pairPeer(payload: {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export function fetchCollaborationPeerProjects(peerId: string, peerAccessToken?: string) {
+  return requestJson<PeerProject[]>(
+    `/api/collaboration/peers/${encodeURIComponent(peerId)}/projects`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ peerAccessToken }),
+    }
+  );
 }
 
 export function createCollaborationSubscription(payload: {

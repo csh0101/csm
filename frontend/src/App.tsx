@@ -22,6 +22,7 @@ import { useI18n } from './i18n';
 import {
   archiveDeleteSession,
   createCollaborationSubscription,
+  fetchCollaborationPeerProjects,
   fetchSessions,
   fetchCollaborationState,
   generateCollaborationIncremental,
@@ -72,6 +73,7 @@ export default function App() {
   const [collaborationSummaryDays, setCollaborationSummaryDays] = useState(7);
   const [isCollaborationLoading, setIsCollaborationLoading] = useState(false);
   const [isPairingPeer, setIsPairingPeer] = useState(false);
+  const [isLoadingPeerProjects, setIsLoadingPeerProjects] = useState(false);
   const [isSavingSharePolicy, setIsSavingSharePolicy] = useState(false);
   const [isGeneratingCollaboration, setIsGeneratingCollaboration] = useState(false);
   const [isRefreshingCollaboration, setIsRefreshingCollaboration] = useState(false);
@@ -87,6 +89,33 @@ export default function App() {
     if (Number.isFinite(response.staleAfterDays) && response.staleAfterDays > 0) {
       setStaleAfterDays(response.staleAfterDays);
       setStaleAfterDaysDraft(String(response.staleAfterDays));
+    }
+  };
+
+  const loadProjectsForPeer = async (
+    peerId: string,
+    peers: CollaborationStateResponse['store']['trustedPeers'],
+    reportErrors = true
+  ) => {
+    const peer = peers.find((item) => item.peerId === peerId);
+    if (!peer?.baseUrl) return;
+
+    setPeerBaseUrl(peer.baseUrl);
+    setIsLoadingPeerProjects(true);
+    if (reportErrors) {
+      setErrorMessage(null);
+      setNoticeMessage(null);
+    }
+    try {
+      const projects = await fetchCollaborationPeerProjects(peerId, peerAccessToken.trim() || undefined);
+      setPeerProjects(projects);
+      setCollaborationProjectId(projects[0]?.projectId || '');
+    } catch (error) {
+      if (reportErrors) {
+        setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_projects_failed'));
+      }
+    } finally {
+      setIsLoadingPeerProjects(false);
     }
   };
 
@@ -113,9 +142,13 @@ export default function App() {
     setIsCollaborationLoading(true);
     try {
       const response = await fetchCollaborationState();
+      const nextSelectedPeerId = selectedPeerId || response.store.trustedPeers[0]?.peerId || '';
       setCollaborationState(response);
       setCollaborationProjectId((current) => current || response.projects[0]?.projectId || '');
-      setSelectedPeerId((current) => current || response.store.trustedPeers[0]?.peerId || '');
+      setSelectedPeerId(nextSelectedPeerId);
+      if (nextSelectedPeerId) {
+        void loadProjectsForPeer(nextSelectedPeerId, response.store.trustedPeers, false);
+      }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_load_failed'));
     } finally {
@@ -342,6 +375,13 @@ export default function App() {
     setPeerBaseUrl(peer.baseUrl);
     setSelectedPeerId('');
     setPeerProjects([]);
+  };
+
+  const handleSelectPeer = async (peerId: string) => {
+    setSelectedPeerId(peerId);
+    setCollaborationProjectId('');
+    setPeerProjects([]);
+    await loadProjectsForPeer(peerId, collaborationState?.store.trustedPeers ?? []);
   };
 
   const handleCreateCollaborationSubscription = async () => {
@@ -592,7 +632,7 @@ export default function App() {
           peerAccessToken={peerAccessToken}
           onPeerAccessTokenChange={setPeerAccessToken}
           selectedPeerId={selectedPeerId}
-          onSelectedPeerIdChange={setSelectedPeerId}
+          onSelectedPeerIdChange={handleSelectPeer}
           peerProjects={peerProjects}
           selectedProjectId={collaborationProjectId}
           onSelectedProjectIdChange={setCollaborationProjectId}
@@ -600,6 +640,7 @@ export default function App() {
           onSummaryDaysChange={setCollaborationSummaryDays}
           isLoading={isCollaborationLoading}
           isPairingPeer={isPairingPeer}
+          isLoadingPeerProjects={isLoadingPeerProjects}
           isGenerating={isGeneratingCollaboration}
           isRefreshingIncremental={isRefreshingCollaboration}
           onRefresh={loadCollaborationState}

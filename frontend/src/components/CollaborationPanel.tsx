@@ -40,6 +40,7 @@ interface CollaborationPanelProps {
   onSummaryDaysChange: (value: number) => void;
   isLoading: boolean;
   isPairingPeer: boolean;
+  isLoadingPeerProjects: boolean;
   isGenerating: boolean;
   isRefreshingIncremental: boolean;
   onRefresh: () => void;
@@ -102,6 +103,7 @@ export function CollaborationPanel({
   onSummaryDaysChange,
   isLoading,
   isPairingPeer,
+  isLoadingPeerProjects,
   isGenerating,
   isRefreshingIncremental,
   onRefresh,
@@ -283,7 +285,9 @@ export function CollaborationPanel({
                       <p className="truncate font-mono text-xs text-slate-500">{card.baseUrl || '-'}</p>
                       {card.kind === 'paired' && (
                         <p className="mt-2 text-xs font-medium text-slate-500">
-                          {t('collab_exposed_project_count', { count: projectCount })}
+                          {isSelected && isLoadingPeerProjects
+                            ? t('collab_loading_projects')
+                            : t('collab_exposed_project_count', { count: projectCount })}
                         </p>
                       )}
                     </button>
@@ -634,8 +638,14 @@ export function CollaborationPanel({
                     })}
                     {peerProjects.length === 0 && (
                       <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white p-10 text-center shadow-sm">
-                        <XCircle className="mb-3 h-8 w-8 text-slate-300" />
-                        <p className="text-sm font-medium text-slate-500">{t('collab_no_peer_projects')}</p>
+                        {isLoadingPeerProjects ? (
+                          <RefreshCw className="mb-3 h-8 w-8 animate-spin text-slate-300" />
+                        ) : (
+                          <XCircle className="mb-3 h-8 w-8 text-slate-300" />
+                        )}
+                        <p className="text-sm font-medium text-slate-500">
+                          {isLoadingPeerProjects ? t('collab_loading_projects') : t('collab_no_peer_projects')}
+                        </p>
                       </div>
                     )}
                   </div>
