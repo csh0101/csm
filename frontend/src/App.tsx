@@ -578,6 +578,10 @@ export default function App() {
             isBulkActionBusy={isMutating}
             onBulkArchiveDelete={handleBulkArchiveDelete}
             onClearSelection={() => setSelectedIds(new Set())}
+            collaborationProjects={collaborationState?.projects ?? []}
+            sharePolicies={collaborationState?.store.projectPolicies ?? []}
+            isSavingSharePolicy={isSavingSharePolicy}
+            onToggleProjectShare={handleToggleSharePolicy}
           />
 
           {focusedSession && (
@@ -609,13 +613,11 @@ export default function App() {
           onSummaryDaysChange={setCollaborationSummaryDays}
           isLoading={isCollaborationLoading}
           isPairingPeer={isPairingPeer}
-          isSavingPolicy={isSavingSharePolicy}
           isGenerating={isGeneratingCollaboration}
           isRefreshingIncremental={isRefreshingCollaboration}
           onRefresh={loadCollaborationState}
           onPairPeer={handlePairPeer}
           onUseDiscoveredPeer={handleUseDiscoveredPeer}
-          onTogglePolicy={handleToggleSharePolicy}
           onCreateSubscription={handleCreateCollaborationSubscription}
           onGenerateIncremental={handleGenerateCollaborationIncremental}
           latestSummary={latestCollaborationSummary}

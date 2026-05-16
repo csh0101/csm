@@ -1,17 +1,19 @@
-import React, { useEffect, useRef } from 'react';
-import { ActivitySummaryResponse, Session, SortDirection, SortField } from '../types';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ActivitySummaryResponse, ProjectIdentity, Session, SharePolicy, SortDirection, SortField } from '../types';
 import { formatDistanceToNow } from 'date-fns';
 import Markdown from 'react-markdown';
 import { cn } from '../lib/utils';
 import {
   AlertCircle,
   ArrowDown,
+  ArrowLeft,
   ArrowUp,
   ArrowUpDown,
   Folder,
   RefreshCw,
   Save,
   Search,
+  Share2,
   Sparkles,
   Trash2,
   X,
@@ -56,6 +58,10 @@ interface MainListProps {
   isBulkActionBusy: boolean;
   onBulkArchiveDelete: () => void;
   onClearSelection: () => void;
+  collaborationProjects: ProjectIdentity[];
+  sharePolicies: SharePolicy[];
+  isSavingSharePolicy: boolean;
+  onToggleProjectShare: (projectId: string, projectPath: string | null, enabled: boolean) => void;
 }
 
 function formatBytes(bytes: number) {
@@ -128,6 +134,37 @@ function LabelBadge({
   );
 }
 
+function pathSegments(path: string) {
+  return path.split(/[\\/]+/).filter(Boolean);
+}
+
+function projectDisplayName(project: ProjectIdentity, duplicateLabels: Set<string>) {
+  if (!duplicateLabels.has(project.pathLabel)) {
+    return project.pathLabel;
+  }
+
+  const segments = pathSegments(project.rootPath || '');
+  if (segments.length >= 2) {
+    return `${segments[segments.length - 2]}/${project.pathLabel}`;
+  }
+
+  return project.rootPath || project.pathLabel;
+}
+
+function pathIsWithinRoot(path: string, root: string) {
+  const normalizedPath = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedRoot = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+function findProjectIdentity(projects: ProjectIdentity[], projectPath: string | null) {
+  if (!projectPath) {
+    return projects.find((project) => !project.rootPath);
+  }
+
+  return projects.find((project) => project.rootPath && pathIsWithinRoot(projectPath, project.rootPath));
+}
+
 function SortHeader({
   field,
   label,
@@ -196,23 +233,139 @@ export function MainList({
   selectedCount,
   isBulkActionBusy,
   onBulkArchiveDelete,
-  onClearSelection
+  onClearSelection,
+  collaborationProjects,
+  sharePolicies,
+  isSavingSharePolicy,
+  onToggleProjectShare
 }: MainListProps) {
   const { t } = useI18n();
   const selectAllRef = useRef<HTMLInputElement>(null);
-  const selectedVisibleCount = sessions.filter(session => selectedIds.has(session.id)).length;
-  const allSelected = sessions.length > 0 && selectedVisibleCount === sessions.length;
-  const hasPartialSelection = selectedVisibleCount > 0 && !allSelected;
+  const [selectedProjectPath, setSelectedProjectPath] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; projectPath: string | null } | null>(null);
   const activitySummaryGeneratedAt = activitySummary
     ? formatDistanceToNow(new Date(activitySummary.generatedAt), { addSuffix: true })
     : '';
   const summaryDayOptions = [1, 7, 14, 30, 90];
+  const unknownProjectLabel = t('project_path_unknown');
+  const duplicateProjectLabels = useMemo(() => {
+    const counts = new Map<string, number>();
+    collaborationProjects.forEach((project) => {
+      counts.set(project.pathLabel, (counts.get(project.pathLabel) ?? 0) + 1);
+    });
+    return new Set(
+      Array.from(counts.entries())
+        .filter(([, count]) => count > 1)
+        .map(([label]) => label)
+    );
+  }, [collaborationProjects]);
+  const projects = useMemo(() => {
+    const projectMap = new Map<
+      string,
+      {
+        key: string;
+        path: string | null;
+        label: string;
+        count: number;
+        size: number;
+        modified: number;
+        labels: Set<string>;
+      }
+    >();
+
+    sessions.forEach((session) => {
+      const key = session.projectPath || '';
+      const identity = findProjectIdentity(collaborationProjects, session.projectPath || null);
+      const existing = projectMap.get(key);
+      const project = existing ?? {
+        key,
+        path: session.projectPath || null,
+        label: identity ? projectDisplayName(identity, duplicateProjectLabels) : session.projectPath || unknownProjectLabel,
+        count: 0,
+        size: 0,
+        modified: 0,
+        labels: new Set<string>(),
+      };
+
+      project.count += 1;
+      project.size += session.size;
+      project.modified = Math.max(project.modified, new Date(session.lastModified).getTime());
+      session.labels.forEach((label) => project.labels.add(label));
+      projectMap.set(key, project);
+    });
+
+    return Array.from(projectMap.values()).sort((a, b) => {
+      if (b.modified !== a.modified) return b.modified - a.modified;
+      return a.label.localeCompare(b.label);
+    });
+  }, [collaborationProjects, duplicateProjectLabels, sessions, unknownProjectLabel]);
+  const displayedSessions = useMemo(() => {
+    if (selectedProjectPath === null) return [];
+    return sessions.filter((session) => (session.projectPath || '') === selectedProjectPath);
+  }, [selectedProjectPath, sessions]);
+  const selectedDisplayedCount = displayedSessions.filter(session => selectedIds.has(session.id)).length;
+  const allSelected = displayedSessions.length > 0 && selectedDisplayedCount === displayedSessions.length;
+  const hasPartialSelection = selectedDisplayedCount > 0 && !allSelected;
+  const selectedProject = selectedProjectPath === null
+    ? null
+    : projects.find((project) => project.key === selectedProjectPath) ?? null;
+  const selectedProjectTitle = selectedProject
+    ? selectedProject.path || selectedProject.label
+    : '';
+
+  const findCollaborationProject = (projectPath: string | null) =>
+    findProjectIdentity(collaborationProjects, projectPath);
+
+  const findSharePolicy = (projectPath: string | null) => {
+    const project = findCollaborationProject(projectPath);
+    return project ? sharePolicies.find((policy) => policy.projectId === project.projectId) : undefined;
+  };
+
+  const isProjectShared = (projectPath: string | null) => findSharePolicy(projectPath)?.enabled ?? false;
+
+  const handleProjectContextMenu = (event: React.MouseEvent, projectPath: string | null) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, projectPath });
+  };
+
+  const handleToggleContextProjectShare = () => {
+    if (!contextMenu) return;
+    const project = findCollaborationProject(contextMenu.projectPath);
+    if (!project) return;
+    onToggleProjectShare(project.projectId, project.rootPath ?? contextMenu.projectPath, !isProjectShared(contextMenu.projectPath));
+    setContextMenu(null);
+  };
+
+  const handleSelectDisplayedSessions = () => {
+    if (allSelected) {
+      displayedSessions.forEach((session) => {
+        if (selectedIds.has(session.id)) onToggleSelect(session.id);
+      });
+      return;
+    }
+
+    displayedSessions.forEach((session) => {
+      if (!selectedIds.has(session.id)) onToggleSelect(session.id);
+    });
+  };
 
   useEffect(() => {
     if (selectAllRef.current) {
       selectAllRef.current.indeterminate = hasPartialSelection;
     }
   }, [hasPartialSelection]);
+
+  useEffect(() => {
+    if (selectedProjectPath !== null && !projects.some((project) => project.key === selectedProjectPath)) {
+      setSelectedProjectPath(null);
+    }
+  }, [projects, selectedProjectPath]);
+
+  useEffect(() => {
+    const closeContextMenu = () => setContextMenu(null);
+    document.addEventListener('click', closeContextMenu);
+    return () => document.removeEventListener('click', closeContextMenu);
+  }, []);
   
   return (
     <main className="flex-1 flex min-h-0 flex-col min-w-0 font-sans">
@@ -308,7 +461,9 @@ export function MainList({
             <span>{isGeneratingSummary ? t('btn_summary_processing') : t('btn_activity_summary')}</span>
           </button>
           <button className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors shadow-sm max-w-[280px] whitespace-nowrap">
-            <span className="block truncate">{currentFilterText} ({sessions.length})</span>
+            <span className="block truncate">
+              {currentFilterText} ({selectedProjectPath === null ? projects.length : displayedSessions.length})
+            </span>
           </button>
         </div>
       </header>
@@ -417,47 +572,142 @@ export function MainList({
           </div>
         )}
         <div className="bg-white border border-slate-200 rounded-xl shadow-sm h-full flex flex-col overflow-hidden">
+          {selectedProject && (
+            <div className="flex items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
+              <button
+                type="button"
+                onClick={() => setSelectedProjectPath(null)}
+                className="rounded p-1.5 text-slate-500 transition-colors hover:bg-slate-200 hover:text-slate-800"
+                title={t('btn_back_to_projects')}
+                aria-label={t('btn_back_to_projects')}
+              >
+                <ArrowLeft className="h-4 w-4" />
+              </button>
+              <div className="min-w-0">
+                <h3 className="truncate font-mono text-sm font-bold text-slate-700" title={selectedProjectTitle}>
+                  {selectedProjectTitle}
+                </h3>
+                <p className="text-xs text-slate-500">{t('showing_sessions', { count: displayedSessions.length })}</p>
+              </div>
+            </div>
+          )}
           <div className="flex-1 min-h-0 overflow-auto">
             <table className="w-full min-w-[980px] text-left">
               <thead className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider sticky top-0 z-10 shadow-sm">
-                <tr>
-                  <th className="px-4 py-3 w-10 text-center">
-                    <input
-                      ref={selectAllRef}
-                      type="checkbox"
-                      checked={allSelected}
-                      onChange={onSelectAll}
-                      disabled={isBulkActionBusy}
-                      aria-label={t('select_all_visible')}
-                      className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </th>
-                  <th className="px-4 py-3">{t('table_name')}</th>
-                  <th className="px-4 py-3">{t('table_project_path')}</th>
-                  <th className="px-4 py-3">{t('table_labels')}</th>
-                  <th className="px-4 py-3">
-                    <SortHeader
-                      field="lastModified"
-                      label={t('table_modified')}
-                      activeField={sortField}
-                      direction={sortDirection}
-                      onSortChange={onSortChange}
-                    />
-                  </th>
-                  <th className="px-4 py-3">
-                    <SortHeader
-                      field="size"
-                      label={t('table_size')}
-                      activeField={sortField}
-                      direction={sortDirection}
-                      onSortChange={onSortChange}
-                    />
-                  </th>
-                  <th className="px-4 py-3">{t('table_status')}</th>
-                </tr>
+                {selectedProjectPath === null ? (
+                  <tr>
+                    <th className="px-4 py-3">{t('table_project_name')}</th>
+                    <th className="px-4 py-3">{t('table_labels')}</th>
+                    <th className="px-4 py-3">{t('table_modified')}</th>
+                    <th className="px-4 py-3 text-right">{t('table_session_count')}</th>
+                    <th className="px-4 py-3 text-right">{t('table_project_size')}</th>
+                  </tr>
+                ) : (
+                  <tr>
+                    <th className="px-4 py-3 w-10 text-center">
+                      <input
+                        ref={selectAllRef}
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={handleSelectDisplayedSessions}
+                        disabled={isBulkActionBusy}
+                        aria-label={t('select_all_visible')}
+                        className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+                      />
+                    </th>
+                    <th className="px-4 py-3">{t('table_name')}</th>
+                    <th className="px-4 py-3">{t('table_labels')}</th>
+                    <th className="px-4 py-3">
+                      <SortHeader
+                        field="lastModified"
+                        label={t('table_modified')}
+                        activeField={sortField}
+                        direction={sortDirection}
+                        onSortChange={onSortChange}
+                      />
+                    </th>
+                    <th className="px-4 py-3">
+                      <SortHeader
+                        field="size"
+                        label={t('table_size')}
+                        activeField={sortField}
+                        direction={sortDirection}
+                        onSortChange={onSortChange}
+                      />
+                    </th>
+                    <th className="px-4 py-3">{t('table_status')}</th>
+                  </tr>
+                )}
               </thead>
               <tbody className="text-sm divide-y divide-slate-100">
-                {sessions.map((session) => {
+                {selectedProjectPath === null ? (
+                  projects.map((project) => {
+                    const shared = isProjectShared(project.path);
+                    const canShare = Boolean(findCollaborationProject(project.path));
+
+                    return (
+                      <tr
+                        key={project.key}
+                        onClick={() => setSelectedProjectPath(project.key)}
+                        onContextMenu={(event) => handleProjectContextMenu(event, project.path)}
+                        className="group cursor-pointer transition-colors hover:bg-slate-50"
+                      >
+                        <td className="px-4 py-4 min-w-[280px] max-w-[520px]">
+                          <div className="flex items-center gap-2">
+                            <Folder className="h-4 w-4 flex-shrink-0 text-blue-400" />
+                            <div className="min-w-0">
+                              <div className="truncate font-mono text-sm font-medium text-slate-800" title={project.path || project.label}>
+                                {project.path || project.label}
+                              </div>
+                              {!canShare && (
+                                <div className="mt-0.5 text-[10px] font-medium text-slate-400">
+                                  {t('collab_share_unavailable')}
+                                </div>
+                              )}
+                            </div>
+                            {shared && (
+                              <div
+                                className="ml-1 flex items-center justify-center rounded border border-blue-100 bg-blue-50 px-1.5 py-0.5 text-blue-600"
+                                title={t('collab_shared')}
+                              >
+                                <Share2 className="h-3.5 w-3.5" />
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-4">
+                          <div className="flex flex-wrap gap-1.5">
+                            {Array.from(project.labels).slice(0, 3).map((label, idx) => (
+                              <LabelBadge
+                                key={label}
+                                label={label}
+                                index={idx}
+                                isActive={selectedLabelFilters.includes(label)}
+                                onClick={onToggleLabelFilter}
+                              />
+                            ))}
+                            {project.labels.size > 3 && (
+                              <span className="px-1 text-xs font-medium text-slate-400">+{project.labels.size - 3}</span>
+                            )}
+                            {project.labels.size === 0 && <span className="text-slate-400 text-[10px] italic">{t('no_labels')}</span>}
+                          </div>
+                        </td>
+                        <td className="px-4 py-4 text-xs text-slate-500 whitespace-nowrap">
+                          {project.modified > 0 ? formatDistanceToNow(project.modified, { addSuffix: true }) : '-'}
+                        </td>
+                        <td className="px-4 py-4 text-right whitespace-nowrap">
+                          <span className="inline-flex min-w-6 items-center justify-center rounded-full bg-blue-50 px-2 py-0.5 text-xs font-bold text-blue-700">
+                            {project.count}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4 text-right font-mono text-xs text-slate-500 whitespace-nowrap">
+                          {formatBytes(project.size)}
+                        </td>
+                      </tr>
+                    );
+                  })
+                ) : (
+                  displayedSessions.map((session) => {
                   const isSelected = selectedIds.has(session.id);
                   const isFocused = focusedId === session.id;
                   
@@ -493,15 +743,6 @@ export function MainList({
                         <div className="font-medium text-slate-900 truncate">{session.name}</div>
                         <div className="text-xs text-slate-500 truncate w-full mt-0.5">{session.excerpt}</div>
                       </td>
-                      <td className="px-4 py-3 min-w-[220px] max-w-[280px]">
-                        {session.projectPath ? (
-                          <div className="font-mono text-xs text-slate-600 truncate" title={session.projectPath}>
-                            {session.projectPath}
-                          </div>
-                        ) : (
-                          <span className="text-slate-400 text-xs italic">{t('project_path_unknown')}</span>
-                        )}
-                      </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap gap-1.5">
                           {session.labels.map((label, idx) => (
@@ -527,11 +768,17 @@ export function MainList({
                       </td>
                     </tr>
                   );
-                })}
+                }))}
               </tbody>
             </table>
             
-            {sessions.length === 0 && (
+            {selectedProjectPath === null && projects.length === 0 && (
+              <div className="py-24 text-center flex flex-col items-center justify-center text-slate-400">
+                <Folder className="w-10 h-10 mb-3 opacity-20" />
+                <p className="text-base text-slate-600 font-medium tracking-tight">{t('no_sessions')}</p>
+              </div>
+            )}
+            {selectedProjectPath !== null && displayedSessions.length === 0 && (
               <div className="py-24 text-center flex flex-col items-center justify-center text-slate-400">
                 <Search className="w-10 h-10 mb-3 opacity-20" />
                 <p className="text-base text-slate-600 font-medium tracking-tight">{t('no_sessions')}</p>
@@ -540,7 +787,11 @@ export function MainList({
           </div>
           
           <div className="min-h-12 border-t border-slate-100 p-3 flex flex-col gap-3 text-xs text-slate-500 font-medium bg-white shrink-0 mt-auto sm:flex-row sm:items-center sm:justify-between md:p-4">
-            <div>{t('showing_sessions', { count: sessions.length })}</div>
+            <div>
+              {selectedProjectPath === null
+                ? t('showing_projects', { count: projects.length })
+                : t('showing_sessions', { count: displayedSessions.length })}
+            </div>
             <div className="flex items-center gap-2">
               <button className="px-2 py-1 border rounded text-slate-400 cursor-not-allowed">{t('btn_prev')}</button>
               <button className="px-2 py-1 border border-slate-300 rounded bg-slate-50 text-slate-700">1</button>
@@ -549,6 +800,23 @@ export function MainList({
           </div>
         </div>
       </div>
+      {contextMenu && (
+        <div
+          className="fixed z-50 min-w-[190px] rounded-lg border border-slate-200 bg-white py-1 shadow-lg"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={handleToggleContextProjectShare}
+            disabled={isSavingSharePolicy || !findCollaborationProject(contextMenu.projectPath)}
+            className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400"
+          >
+            <Share2 className="h-4 w-4 text-blue-500" />
+            {isProjectShared(contextMenu.projectPath) ? t('collab_unshare_project') : t('collab_share_project')}
+          </button>
+        </div>
+      )}
     </main>
   );
 }
