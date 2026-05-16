@@ -574,41 +574,12 @@ export function CollaborationPanel({
                     )}
                   </div>
                 </div>
-              ) : !selectedPeer && !peerBaseUrl ? (
-                <div className="flex h-64 flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 text-slate-400">
-                  <Wifi className="mb-3 h-10 w-10 opacity-20" />
-                  <p className="text-sm font-medium">{t('collab_select_peer')}</p>
-                </div>
               ) : !selectedPeer ? (
-                <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white p-10 text-center shadow-sm">
-                  <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-blue-100 bg-blue-50">
-                    <ShieldCheck className="h-6 w-6 text-blue-500" />
-                  </div>
-                  <h3 className="mb-2 text-lg font-bold text-slate-800">{t('collab_pairing_required')}</h3>
-                  <div className="mb-6 grid w-full max-w-lg gap-3 sm:grid-cols-[1fr_1fr_auto]">
-                    <input
-                      value={peerBaseUrl}
-                      onChange={(event) => onPeerBaseUrlChange(event.target.value)}
-                      placeholder="http://192.168.1.12:4000"
-                      className="rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                    />
-                    <input
-                      value={peerAccessToken}
-                      onChange={(event) => onPeerAccessTokenChange(event.target.value)}
-                      placeholder={t('collab_peer_token')}
-                      type="password"
-                      className="rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                    />
-                    <button
-                      type="button"
-                      onClick={onPairPeer}
-                      disabled={!canPair}
-                      className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-bold text-white shadow-sm transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
-                    >
-                      <UserPlus className="h-4 w-4" />
-                      {isPairingPeer ? t('collab_pairing') : t('collab_btn_pair')}
-                    </button>
-                  </div>
+                <div className="flex min-h-64 flex-col items-center justify-center px-6 text-center text-slate-400">
+                  <Wifi className="mb-3 h-10 w-10 opacity-20" />
+                  <p className="text-sm font-medium">
+                    {peerBaseUrl.trim() ? t('collab_pair_selected_peer_hint') : t('collab_select_peer')}
+                  </p>
                 </div>
               ) : (
                 <>
