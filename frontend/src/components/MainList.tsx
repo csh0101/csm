@@ -25,7 +25,6 @@ interface MainListProps {
   selectedIds: Set<string>;
   focusedId: string | null;
   onToggleSelect: (id: string) => void;
-  onSelectAll: () => void;
   onFocus: (id: string) => void;
   searchQuery: string;
   onSearchChange: (q: string) => void;
@@ -201,7 +200,6 @@ export function MainList({
   selectedIds, 
   focusedId, 
   onToggleSelect, 
-  onSelectAll, 
   onFocus,
   searchQuery,
   onSearchChange,

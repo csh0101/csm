@@ -7,7 +7,6 @@ import {
   ChevronRight,
   Clipboard,
   Clock,
-  FileText,
   RefreshCw,
   Settings,
   ShieldCheck,
@@ -19,7 +18,6 @@ import {
 import {
   CollaborationStateResponse,
   CollaborationSummary,
-  PeerMetadata,
   PeerPresence,
   PeerProject,
 } from '../types';
@@ -86,13 +84,6 @@ function LocalConfigValue({ label, value, fallback = '-', copied, onCopy }: Loca
       </div>
     </div>
   );
-}
-
-function peerProjectCount(peer: PeerMetadata, selectedPeerId: string, peerProjects: PeerProject[]) {
-  if (peer.peerId === selectedPeerId) {
-    return peerProjects.length;
-  }
-  return 0;
 }
 
 export function CollaborationPanel({
@@ -259,9 +250,7 @@ export function CollaborationPanel({
               <div className="space-y-3">
                 {peerCards.map((card) => {
                   const isSelected = card.kind === 'paired' ? selectedPeerId === card.id : peerBaseUrl === card.baseUrl;
-                  const projectCount = card.kind === 'paired'
-                    ? peerProjectCount({ peerId: card.id, displayName: card.label, trusted: true }, selectedPeerId, peerProjects)
-                    : 0;
+                  const projectCount = card.kind === 'paired' && card.id === selectedPeerId ? peerProjects.length : 0;
                   return (
                     <button
                       key={`${card.kind}:${card.id}`}

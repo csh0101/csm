@@ -216,20 +216,6 @@ export default function App() {
     setSelectedIds(newTarget);
   };
 
-  const handleSelectAll = () => {
-    const filteredIds = filteredSessions.map(s => s.id);
-    const hasSelectedAllFiltered = filteredIds.length > 0 && filteredIds.every(id => selectedIds.has(id));
-    const nextSelected = new Set(selectedIds);
-
-    if (hasSelectedAllFiltered) {
-      filteredIds.forEach(id => nextSelected.delete(id));
-    } else {
-      filteredIds.forEach(id => nextSelected.add(id));
-    }
-
-    setSelectedIds(nextSelected);
-  };
-
   const handleToggleLabelFilter = (label: string) => {
     setSelectedLabelFilters(prev =>
       prev.includes(label)
@@ -545,7 +531,6 @@ export default function App() {
             selectedIds={selectedIds}
             focusedId={focusedId}
             onToggleSelect={handleToggleSelect}
-            onSelectAll={handleSelectAll}
             onFocus={setFocusedId}
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
