@@ -11,8 +11,9 @@ use serde_json::json;
 use crate::{
     error::AppError,
     mounts::{
-        models::{ConnectorKind, CredentialProfile, MountPolicy, MountRecord},
+        models::{ConnectorKind, CredentialProfile, MountAuditRecord, MountPolicy, MountRecord},
         mysql::{self, MysqlConnector},
+        storage,
     },
 };
 
@@ -99,6 +100,40 @@ pub async fn read_virtual_file<C: MysqlConnector>(
     let bytes = enforce_max_file_bytes(bytes, context.policy.max_file_bytes)?;
     cache.insert(key, cache_ttl(&normalized), bytes.clone());
     Ok(bytes)
+}
+
+pub async fn read_virtual_file_audited<C: MysqlConnector>(
+    context: &MountContext,
+    connector: &C,
+    cache: &MountCache,
+    store_path: &Path,
+    virtual_path: &str,
+) -> Result<Vec<u8>, AppError> {
+    let started = Instant::now();
+    let result = read_virtual_file(context, connector, cache, virtual_path).await;
+    let duration_ms = started.elapsed().as_millis();
+    let (result_label, bytes_returned, error) = match &result {
+        Ok(bytes) => ("ok".to_string(), bytes.len(), None),
+        Err(error) => ("error".to_string(), 0, Some(error.to_string())),
+    };
+
+    let mut store = storage::load_mount_store(store_path)?;
+    storage::append_audit_event(
+        &mut store,
+        MountAuditRecord {
+            timestamp: chrono::Utc::now(),
+            project_id: context.mount.project_id.clone(),
+            mount_id: context.mount.mount_id.clone(),
+            virtual_path: normalize_virtual_path(virtual_path),
+            result: result_label,
+            bytes_returned,
+            duration_ms,
+            error,
+        },
+    );
+    storage::save_mount_store(store_path, &store)?;
+
+    result
 }
 
 pub async fn readdir_virtual<C: MysqlConnector>(
@@ -440,6 +475,10 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use serde_json::{Value, json};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::mounts::models::{
         ColumnInfo, ConnectorKind, CredentialProfile, ForeignKeyInfo, IndexInfo, MountStatus,
@@ -502,6 +541,40 @@ mod tests {
 
         assert_eq!(value["id"], 123);
         assert_eq!(value["email"], "[redacted-email]");
+    }
+
+    #[tokio::test]
+    async fn audited_read_records_virtual_file_access() {
+        let context = test_context();
+        let connector = MockConnector;
+        let cache = MountCache::default();
+        let temp_dir = unique_temp_dir("audit");
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let store_path = temp_dir.join("mounts.json");
+
+        let bytes = read_virtual_file_audited(
+            &context,
+            &connector,
+            &cache,
+            &store_path,
+            "schemas/app/tables/users/sample.jsonl",
+        )
+        .await
+        .expect("audited read");
+        let store = storage::load_mount_store(&store_path).expect("load store");
+
+        assert!(!bytes.is_empty());
+        assert_eq!(store.audit_events.len(), 1);
+        assert_eq!(store.audit_events[0].project_id, "project_a");
+        assert_eq!(store.audit_events[0].mount_id, "mysql-main");
+        assert_eq!(
+            store.audit_events[0].virtual_path,
+            "schemas/app/tables/users/sample.jsonl"
+        );
+        assert_eq!(store.audit_events[0].result, "ok");
+        assert!(store.audit_events[0].bytes_returned > 0);
+
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     fn test_context() -> MountContext {
@@ -656,5 +729,16 @@ mod tests {
         ) -> Result<Option<u64>, AppError> {
             Ok(Some(1))
         }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "csm-router-{prefix}-{}-{stamp}",
+            std::process::id()
+        ))
     }
 }
