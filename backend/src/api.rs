@@ -1811,7 +1811,12 @@ fn resolve_mount_point(
     mount_id: &str,
     request: &CreateMountRequest,
 ) -> Result<PathBuf, AppError> {
-    match request.mount_point.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
+    match request
+        .mount_point
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
         Some(path) => Ok(PathBuf::from(path)),
         None => match request.mount_point_mode.as_deref().unwrap_or("project") {
             "project" => Ok(fuse::project_mount_point(project_root, mount_id)),

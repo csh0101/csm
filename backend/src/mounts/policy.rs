@@ -97,7 +97,11 @@ pub fn redact_object(policy: &MountPolicy, fields: Map<String, Value>) -> Map<St
         .collect()
 }
 
-pub fn top_values_allowed(policy: &MountPolicy, column: &str, distinct_estimate: Option<u64>) -> bool {
+pub fn top_values_allowed(
+    policy: &MountPolicy,
+    column: &str,
+    distinct_estimate: Option<u64>,
+) -> bool {
     !is_sensitive_column(policy, column)
         && !is_large_json_column(column)
         && distinct_estimate.is_none_or(|estimate| estimate <= 100)
@@ -147,8 +151,11 @@ mod tests {
 
         policy.allow_custom_queries = true;
         assert_eq!(
-            authorize_custom_query(&policy, "select * from users join orders on users.id = orders.user_id")
-                .unwrap_err(),
+            authorize_custom_query(
+                &policy,
+                "select * from users join orders on users.id = orders.user_id"
+            )
+            .unwrap_err(),
             QueryPolicyError::JoinDisabled
         );
     }

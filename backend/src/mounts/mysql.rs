@@ -141,7 +141,9 @@ impl MysqlConnector for LiveMysqlConnector {
             let policy = policy.clone();
             async move {
                 let mut schemas: Vec<String> = conn
-                    .query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME")
+                    .query(
+                        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME",
+                    )
                     .await
                     .map_err(|error| AppError::External(error.to_string()))?;
                 schemas.retain(|schema| policy::schema_allowed(&policy, schema));
@@ -331,7 +333,16 @@ impl MysqlConnector for LiveMysqlConnector {
     ) -> Result<Vec<Value>, AppError> {
         ensure_table(policy, schema, table)?;
         let limit = max_rows.min(policy.max_lookup_rows).min(1000);
-        json_rows(self, policy, schema, table, Some(column), Some(value), limit).await
+        json_rows(
+            self,
+            policy,
+            schema,
+            table,
+            Some(column),
+            Some(value),
+            limit,
+        )
+        .await
     }
 
     async fn count(
@@ -357,16 +368,20 @@ impl MysqlConnector for LiveMysqlConnector {
     }
 }
 
-pub fn infer_relations(columns: &[ColumnInfo], known_tables: &[String], schema: &str) -> Vec<InferredRelation> {
+pub fn infer_relations(
+    columns: &[ColumnInfo],
+    known_tables: &[String],
+    schema: &str,
+) -> Vec<InferredRelation> {
     columns
         .iter()
         .filter_map(|column| {
             let name = column.name.as_str();
             let stem = name.strip_suffix("_id")?;
             let plural = format!("{stem}s");
-            let table = known_tables
-                .iter()
-                .find(|table| table.eq_ignore_ascii_case(&plural) || table.eq_ignore_ascii_case(stem))?;
+            let table = known_tables.iter().find(|table| {
+                table.eq_ignore_ascii_case(&plural) || table.eq_ignore_ascii_case(stem)
+            })?;
             Some(InferredRelation {
                 confidence: "medium".to_string(),
                 column: column.name.clone(),
@@ -442,7 +457,9 @@ async fn json_rows(
     }
     if let Some(column) = where_column {
         if !columns.iter().any(|known| known.name == column) {
-            return Err(AppError::NotFound(format!("column '{column}' was not found")));
+            return Err(AppError::NotFound(format!(
+                "column '{column}' was not found"
+            )));
         }
     }
 
@@ -463,7 +480,10 @@ async fn json_rows(
         quote_identifier(table)
     );
     if let Some(column) = where_column {
-        query.push_str(&format!(" WHERE {} = :lookup_value", quote_identifier(column)));
+        query.push_str(&format!(
+            " WHERE {} = :lookup_value",
+            quote_identifier(column)
+        ));
     }
     query.push_str(" LIMIT :limit");
 
@@ -485,7 +505,10 @@ async fn json_rows(
                     .map_err(|error| AppError::External(error.to_string()))?;
                 let values = rows
                     .into_iter()
-                    .map(|raw| serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({ "raw": raw })))
+                    .map(|raw| {
+                        serde_json::from_str::<Value>(&raw)
+                            .unwrap_or_else(|_| json!({ "raw": raw }))
+                    })
                     .map(|row| policy::redact_row(policy, row))
                     .collect();
                 Ok((conn, values))
@@ -506,7 +529,9 @@ fn ensure_schema(policy: &MountPolicy, schema: &str) -> Result<(), AppError> {
     if policy::schema_allowed(policy, schema) {
         Ok(())
     } else {
-        Err(AppError::BadRequest(format!("schema '{schema}' is blocked by policy")))
+        Err(AppError::BadRequest(format!(
+            "schema '{schema}' is blocked by policy"
+        )))
     }
 }
 
@@ -599,7 +624,11 @@ fn parse_env_lines(content: &str) -> BTreeMap<String, String> {
             let (key, value) = line.split_once('=')?;
             Some((
                 key.trim().to_string(),
-                value.trim().trim_matches('"').trim_matches('\'').to_string(),
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
             ))
         })
         .collect()
@@ -621,7 +650,10 @@ pub fn row_list_json(rows: Vec<Value>) -> Value {
     Value::Array(rows)
 }
 
-pub fn manifest_from_indexes(indexes: &[IndexInfo], policy: &MountPolicy) -> Vec<crate::mounts::models::LookupManifestEntry> {
+pub fn manifest_from_indexes(
+    indexes: &[IndexInfo],
+    policy: &MountPolicy,
+) -> Vec<crate::mounts::models::LookupManifestEntry> {
     let mut entries = Vec::new();
     for index in indexes {
         if index.columns.len() != 1 {

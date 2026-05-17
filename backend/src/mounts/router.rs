@@ -153,10 +153,16 @@ pub async fn readdir_virtual<C: MysqlConnector>(
             {
                 dirs.push("by-primary".to_string());
             }
-            if manifest.iter().any(|entry| entry.query_shape == "unique-key") {
+            if manifest
+                .iter()
+                .any(|entry| entry.query_shape == "unique-key")
+            {
                 dirs.push("by-unique".to_string());
             }
-            if manifest.iter().any(|entry| entry.query_shape == "index-lookup") {
+            if manifest
+                .iter()
+                .any(|entry| entry.query_shape == "index-lookup")
+            {
                 dirs.push("by-index".to_string());
             }
             dirs.push("README.md".to_string());
@@ -544,7 +550,11 @@ mod tests {
             Ok(vec!["app".to_string()])
         }
 
-        async fn tables(&self, _policy: &MountPolicy, _schema: &str) -> Result<Vec<String>, AppError> {
+        async fn tables(
+            &self,
+            _policy: &MountPolicy,
+            _schema: &str,
+        ) -> Result<Vec<String>, AppError> {
             Ok(vec!["users".to_string(), "orders".to_string()])
         }
 
