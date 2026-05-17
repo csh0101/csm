@@ -1,3 +1,4 @@
+pub mod fuse;
 pub mod models;
 pub mod mysql;
 pub mod policy;
