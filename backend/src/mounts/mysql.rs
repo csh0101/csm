@@ -97,7 +97,7 @@ impl LiveMysqlConnector {
         Fut: std::future::Future<Output = Result<(mysql_async::Conn, T), AppError>> + Send,
     {
         let pool = self.pool()?;
-        let mut conn = timeout(
+        let conn = timeout(
             Duration::from_millis(policy.query_timeout_ms),
             pool.get_conn(),
         )
@@ -108,9 +108,8 @@ impl LiveMysqlConnector {
             .await
             .map_err(|_| AppError::External("MySQL query timed out".to_string()))?;
         let (returned_conn, value) = result?;
-        conn = returned_conn;
+        drop(returned_conn);
         let disconnect = pool.disconnect().await;
-        drop(conn);
         if let Err(error) = disconnect {
             tracing::debug!("failed to disconnect MySQL pool cleanly: {error}");
         }
