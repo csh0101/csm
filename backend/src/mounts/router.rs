@@ -374,7 +374,7 @@ async fn render_lookup<C: MysqlConnector>(
             && index.columns[0] == lookup.column
             && match lookup.kind {
                 LookupKind::Primary => index.primary,
-                LookupKind::Unique => index.unique,
+                LookupKind::Unique => index.unique && !index.primary,
                 LookupKind::Index => !index.unique,
             }
     });
@@ -544,6 +544,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_key_is_not_authorized_as_unique_lookup() {
+        let context = test_context();
+        let connector = MockConnector;
+        let cache = MountCache::default();
+
+        let error = read_virtual_file(
+            &context,
+            &connector,
+            &cache,
+            "schemas/app/tables/users/lookup/by-unique/id/123.json",
+        )
+        .await
+        .expect_err("primary key should not be accepted under by-unique");
+
+        assert!(error.to_string().contains("lookup by 'id' is not allowed"));
+    }
+
+    #[tokio::test]
     async fn audited_read_records_virtual_file_access() {
         let context = test_context();
         let connector = MockConnector;
@@ -683,6 +701,12 @@ mod tests {
                     name: "idx_user_id".to_string(),
                     columns: vec!["user_id".to_string()],
                     unique: false,
+                    primary: false,
+                },
+                IndexInfo {
+                    name: "uniq_email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
                     primary: false,
                 },
             ])
