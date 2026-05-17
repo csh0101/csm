@@ -10,6 +10,8 @@ import {
   IncrementalSummaryResponse,
   PairPeerResponse,
   PeerProject,
+  ProjectIdentity,
+  ResolveProjectResponse,
 } from './types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
@@ -138,15 +140,40 @@ export function generateActivitySummary(days = 7, language = 'zh') {
   });
 }
 
+export function fetchProjects() {
+  return requestJson<ProjectIdentity[]>('/api/projects');
+}
+
+export function resolveProject(path: string) {
+  return requestJson<ResolveProjectResponse>('/api/projects/resolve', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+}
+
 export function fetchCollaborationState() {
   return requestJson<CollaborationStateResponse>('/api/collaboration');
 }
 
-export function updateLocalCollaborationConfig(payload: { displayName: string }) {
+export function updateLocalCollaborationConfig(payload: {
+  displayName?: string;
+  peerToken?: string;
+  refreshPeerToken?: boolean;
+}) {
   return requestJson<CollaborationStateResponse>('/api/collaboration/local-config', {
     method: 'PATCH',
     body: JSON.stringify(payload),
   });
+}
+
+export function updatePeerAccessToken(peerId: string, peerAccessToken: string) {
+  return requestJson<CollaborationStateResponse>(
+    `/api/collaboration/peers/${encodeURIComponent(peerId)}/token`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ peerAccessToken }),
+    }
+  );
 }
 
 export function updateSharePolicy(
@@ -212,11 +239,25 @@ export function createCollaborationSubscription(payload: {
   days?: number;
   language?: string;
   topics?: string[];
+  analysisCycle?: '10m' | '1h' | 'manual';
 }) {
   return requestJson<CreateSubscriptionResponse>('/api/collaboration/subscriptions', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+export function updateSubscriptionSchedule(
+  subscriptionId: string,
+  analysisCycle: '10m' | '1h' | 'manual'
+) {
+  return requestJson<CollaborationStateResponse>(
+    `/api/collaboration/subscriptions/${encodeURIComponent(subscriptionId)}/schedule`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ analysisCycle }),
+    }
+  );
 }
 
 export function generateCollaborationIncremental(payload: {

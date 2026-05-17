@@ -1,7 +1,7 @@
 [package]
 name = "codex-session-manager-tauri"
 version = "0.1.0"
-description = "Codex Session Manager desktop app"
+description = "Traceway desktop app"
 authors = ["d-robotics"]
 license = ""
 repository = ""

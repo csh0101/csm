@@ -1,6 +1,6 @@
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use backend::{config::Config, server, state::AppState};
+use backend::{config::Config, scheduler, server, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(config)?;
     tracing::info!("using data dir {}", state.config.data_dir.display());
     tracing::info!("listening on http://{}", bind_addr);
+    tokio::spawn(scheduler::run(state.clone()));
 
     server::serve_with_shutdown(state, bind_addr, shutdown_signal()).await?;
 

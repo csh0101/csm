@@ -1,6 +1,6 @@
-# Codex Session Manager
+# Traceway
 
-Local workspace for the Codex Session Manager frontend and Rust backend.
+Local workspace for the Traceway frontend and Rust backend.
 
 ## Project Layout
 
@@ -89,7 +89,7 @@ These endpoints require `CSM_PEER_TOKEN`, project share policy allowlisting, a s
 
 The archive-delete endpoint copies the source file into the configured local archive directory, records a checksum, and only then marks the session as deleted in manager metadata. The archive provider is intentionally isolated behind this API so an S3 provider can replace the local copy implementation later.
 
-The activity summary endpoint filters non-deleted sessions modified within the requested time window, compresses the session data, and calls `codex exec --ephemeral --sandbox read-only` to generate a Markdown report. The UI currently offers 1, 7, 14, 30, and 90 day ranges.
+The activity summary endpoint filters non-deleted sessions modified within the requested time window, compresses the session data, and calls `codex exec --ephemeral --sandbox read-only` to generate a Markdown report. The UI currently offers 1, 7, 14, 30, and 90 day ranges. The Codex subprocess defaults to a 600 second timeout; override it with `CSM_CODEX_EXEC_TIMEOUT_SECS` when needed.
 
 The backend also stores the last successfully scanned workspace path in metadata. On startup it attempts a best-effort rescan of that path so labels, notes, deleted status, and the visible session list survive a backend restart when the workspace is still available.
 

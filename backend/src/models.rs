@@ -242,6 +242,8 @@ pub struct PeerMetadata {
     pub public_key: Option<String>,
     pub base_url: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub access_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -267,6 +269,36 @@ pub enum SubscriptionStatus {
     Revoked,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AnalysisCycle {
+    #[serde(rename = "10m")]
+    EveryTenMinutes,
+    #[serde(rename = "1h")]
+    Hourly,
+    #[serde(rename = "manual")]
+    Manual,
+}
+
+impl AnalysisCycle {
+    pub fn duration_minutes(&self) -> Option<i64> {
+        match self {
+            AnalysisCycle::EveryTenMinutes => Some(10),
+            AnalysisCycle::Hourly => Some(60),
+            AnalysisCycle::Manual => None,
+        }
+    }
+}
+
+impl Default for AnalysisCycle {
+    fn default() -> Self {
+        default_analysis_cycle()
+    }
+}
+
+pub fn default_analysis_cycle() -> AnalysisCycle {
+    AnalysisCycle::Hourly
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
@@ -277,6 +309,16 @@ pub struct Subscription {
     pub topics: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub baseline_generated_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_analysis_cycle")]
+    pub analysis_cycle: AnalysisCycle,
+    #[serde(default)]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_run_status: Option<String>,
+    #[serde(default)]
+    pub last_run_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -284,6 +326,8 @@ pub struct Subscription {
 pub struct CollaborationStore {
     pub schema_version: u32,
     pub local_peer: Option<PeerMetadata>,
+    #[serde(default)]
+    pub local_peer_token: Option<String>,
     pub sources: Vec<CollaborationSource>,
     pub trusted_peers: Vec<PeerMetadata>,
     pub project_policies: Vec<SharePolicy>,
@@ -298,6 +342,7 @@ impl Default for CollaborationStore {
         Self {
             schema_version: 1,
             local_peer: None,
+            local_peer_token: None,
             sources: Vec::new(),
             trusted_peers: Vec::new(),
             project_policies: Vec::new(),
@@ -306,5 +351,32 @@ impl Default for CollaborationStore {
             summaries: Vec::new(),
             hints: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_defaults_missing_schedule_fields_to_hourly() {
+        let subscription: Subscription = serde_json::from_str(
+            r#"{
+                "subscriptionId": "sub_1",
+                "peerId": "peer_1",
+                "projectId": "project_1",
+                "status": "active",
+                "topics": [],
+                "createdAt": "2026-05-17T00:00:00Z",
+                "baselineGeneratedAt": "2026-05-17T00:00:00Z"
+            }"#,
+        )
+        .expect("deserialize legacy subscription");
+
+        assert_eq!(subscription.analysis_cycle, AnalysisCycle::Hourly);
+        assert!(subscription.next_run_at.is_none());
+        assert!(subscription.last_run_at.is_none());
+        assert!(subscription.last_run_status.is_none());
+        assert!(subscription.last_run_error.is_none());
     }
 }

@@ -16,12 +16,12 @@ use crate::{
     discovery,
     error::AppError,
     models::{
-        ArchiveRecord, CollaborationSource, CollaborationSourceKind, CollaborationStore,
-        CollaborationSummary, FilterCounts, LabelCount, MetadataFile, PeerMetadata, PeerPresence,
-        ProjectIdentity, Session, SessionDeltaCursor, SessionMeta, SessionStatus, SharePolicy,
-        Subscription, SubscriptionStatus,
+        AnalysisCycle, ArchiveRecord, CollaborationSource, CollaborationSourceKind,
+        CollaborationStore, CollaborationSummary, FilterCounts, LabelCount, MetadataFile,
+        PeerMetadata, PeerPresence, ProjectIdentity, Session, SessionDeltaCursor, SessionMeta,
+        SessionStatus, SharePolicy, Subscription, SubscriptionStatus,
     },
-    scanner,
+    project, scanner,
     state::SharedState,
     storage,
     summary::{self, ActivitySummaryRequest, ActivitySummaryResponse},
@@ -106,6 +106,18 @@ pub struct CollaborationStateResponse {
     pub local_config: LocalCollaborationConfig,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveProjectRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveProjectResponse {
+    pub project: ProjectIdentity,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalCollaborationConfig {
@@ -132,7 +144,9 @@ pub struct UpdateSharePolicyRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateLocalCollaborationConfigRequest {
-    pub display_name: String,
+    pub display_name: Option<String>,
+    pub peer_token: Option<String>,
+    pub refresh_peer_token: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +173,12 @@ pub struct PeerProjectsRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdatePeerAccessTokenRequest {
+    pub peer_access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSubscriptionRequest {
     pub peer_id: Option<String>,
     pub peer_base_url: Option<String>,
@@ -167,6 +187,7 @@ pub struct CreateSubscriptionRequest {
     pub days: Option<i64>,
     pub language: Option<String>,
     pub topics: Option<Vec<String>>,
+    pub analysis_cycle: Option<AnalysisCycle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +205,12 @@ pub struct IncrementalSummaryRequest {
     pub peer_access_token: Option<String>,
     pub since: Option<chrono::DateTime<Utc>>,
     pub language: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSubscriptionScheduleRequest {
+    pub analysis_cycle: AnalysisCycle,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +238,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/sessions/{id}/labels", patch(update_labels))
         .route("/api/sessions/{id}/notes", patch(update_notes))
         .route("/api/summaries/activity", post(generate_activity_summary))
+        .route("/api/projects", get(list_projects))
+        .route("/api/projects/resolve", post(resolve_project))
         .route("/api/collaboration", get(get_collaboration_state))
         .route(
             "/api/collaboration/local-config",
@@ -221,6 +250,14 @@ pub fn router(state: SharedState) -> Router {
             patch(update_share_policy),
         )
         .route("/api/collaboration/peers/pair", post(pair_peer))
+        .route(
+            "/api/collaboration/subscriptions/{subscriptionId}/schedule",
+            patch(update_subscription_schedule),
+        )
+        .route(
+            "/api/collaboration/peers/{peerId}/token",
+            patch(update_trusted_peer_token),
+        )
         .route(
             "/api/collaboration/peers/{peerId}/projects",
             post(trusted_peer_projects),
@@ -248,7 +285,7 @@ pub fn router(state: SharedState) -> Router {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        service: "codex-session-manager-backend",
+        service: "traceway-backend",
     })
 }
 
@@ -265,11 +302,12 @@ async fn peer_health(State(state): State<SharedState>) -> Json<PeerHealthRespons
         public_key: None,
         base_url: Some(fallback_base_url),
         last_seen_at: Some(Utc::now()),
+        access_token: None,
     });
 
     Json(PeerHealthResponse {
         status: "ok".to_string(),
-        service: "codex-session-manager-peer".to_string(),
+        service: "traceway-peer".to_string(),
         peer_id: peer.peer_id,
         display_name: peer.display_name,
         base_url: peer.base_url,
@@ -280,27 +318,63 @@ async fn update_local_collaboration_config(
     State(state): State<SharedState>,
     Json(request): Json<UpdateLocalCollaborationConfigRequest>,
 ) -> Result<Json<CollaborationStateResponse>, AppError> {
-    let display_name = request.display_name.trim();
-    if display_name.is_empty() {
+    let display_name = request
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|display_name| !display_name.is_empty())
+        .map(|display_name| display_name.chars().take(80).collect::<String>());
+    if request.display_name.is_some() && display_name.is_none() {
         return Err(AppError::BadRequest(
             "displayName must not be empty".to_string(),
         ));
     }
+    let requested_peer_token =
+        normalize_optional_text(request.peer_token.clone().unwrap_or_default());
+    if request.peer_token.is_some() && requested_peer_token.is_none() {
+        return Err(AppError::BadRequest(
+            "peerToken must not be empty".to_string(),
+        ));
+    }
 
-    let display_name = display_name.chars().take(80).collect::<String>();
-    let peer = {
+    let (peer, display_name_changed) = {
         let mut inner = state.inner.write().await;
         let base_url = format!("http://{}", state.config.bind_addr);
+        let display_name = display_name
+            .clone()
+            .or_else(|| {
+                inner
+                    .collaboration
+                    .local_peer
+                    .as_ref()
+                    .map(|peer| peer.display_name.clone())
+            })
+            .unwrap_or_else(|| state.config.peer_display_name.clone());
+        let display_name_changed = inner
+            .collaboration
+            .local_peer
+            .as_ref()
+            .is_none_or(|peer| peer.display_name != display_name);
         let peer = collaboration::ensure_local_peer(
             &mut inner.collaboration,
             display_name.clone(),
             base_url,
         );
+        if request.refresh_peer_token.unwrap_or(false) {
+            inner.collaboration.local_peer_token = Some(collaboration::generate_peer_token());
+        } else if let Some(peer_token) = requested_peer_token {
+            inner.collaboration.local_peer_token = Some(peer_token);
+        } else {
+            collaboration::ensure_local_peer_token(
+                &mut inner.collaboration,
+                state.config.peer_token.clone(),
+            );
+        }
         storage::save_collaboration_store(&state.config.collaboration_path, &inner.collaboration)?;
-        peer
+        (peer, display_name_changed)
     };
 
-    if state.config.lan_discovery_enabled {
+    if state.config.lan_discovery_enabled && display_name_changed {
         {
             let mut discovery = state
                 .lan_discovery
@@ -336,14 +410,15 @@ async fn peer_projects(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<collaboration::PeerProject>>, AppError> {
-    require_peer_token(&headers, state.config.peer_token.as_deref())?;
-    let (sessions, policies) = {
+    let (sessions, policies, token) = {
         let inner = state.inner.read().await;
         (
             inner.sessions.values().cloned().collect::<Vec<_>>(),
             inner.collaboration.project_policies.clone(),
+            effective_local_peer_token(&inner.collaboration, &state.config),
         )
     };
+    require_peer_token(&headers, token.as_deref())?;
 
     Ok(Json(collaboration::peer_projects(&sessions, &policies)))
 }
@@ -353,14 +428,15 @@ async fn peer_sessions(
     headers: HeaderMap,
     Query(query): Query<PeerSessionsQuery>,
 ) -> Result<Json<Vec<collaboration::PeerSessionSummary>>, AppError> {
-    require_peer_token(&headers, state.config.peer_token.as_deref())?;
-    let (sessions, policies) = {
+    let (sessions, policies, token) = {
         let inner = state.inner.read().await;
         (
             inner.sessions.values().cloned().collect::<Vec<_>>(),
             inner.collaboration.project_policies.clone(),
+            effective_local_peer_token(&inner.collaboration, &state.config),
         )
     };
+    require_peer_token(&headers, token.as_deref())?;
 
     Ok(Json(collaboration::peer_session_summaries(
         &sessions, &policies, &query,
@@ -372,16 +448,17 @@ async fn peer_session_detail(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<collaboration::PeerSessionDetail>, AppError> {
-    require_peer_token(&headers, state.config.peer_token.as_deref())?;
-    let (session, policies) = {
+    let (session, policies, token) = {
         let inner = state.inner.read().await;
         let session = find_session_by_public_id(&inner.sessions, &id)
             .ok_or_else(|| AppError::NotFound(format!("session '{id}' was not found")))?;
         (
             session.clone(),
             inner.collaboration.project_policies.clone(),
+            effective_local_peer_token(&inner.collaboration, &state.config),
         )
     };
+    require_peer_token(&headers, token.as_deref())?;
 
     Ok(Json(collaboration::peer_session_detail(
         &session, &policies,
@@ -394,20 +471,38 @@ async fn peer_session_deltas(
     headers: HeaderMap,
     Query(query): Query<PeerDeltasQuery>,
 ) -> Result<Json<collaboration::PeerDeltasResponse>, AppError> {
-    require_peer_token(&headers, state.config.peer_token.as_deref())?;
-    let (session, policies) = {
+    let (session, policies, token) = {
         let inner = state.inner.read().await;
         let session = find_session_by_public_id(&inner.sessions, &id)
             .ok_or_else(|| AppError::NotFound(format!("session '{id}' was not found")))?;
         (
             session.clone(),
             inner.collaboration.project_policies.clone(),
+            effective_local_peer_token(&inner.collaboration, &state.config),
         )
     };
+    require_peer_token(&headers, token.as_deref())?;
 
     Ok(Json(collaboration::peer_session_deltas(
         &session, &policies, &query,
     )?))
+}
+
+async fn list_projects(State(state): State<SharedState>) -> Json<Vec<ProjectIdentity>> {
+    let sessions = {
+        let inner = state.inner.read().await;
+        inner.sessions.values().cloned().collect::<Vec<_>>()
+    };
+
+    Json(collaboration_projects(&sessions))
+}
+
+async fn resolve_project(
+    Json(request): Json<ResolveProjectRequest>,
+) -> Json<ResolveProjectResponse> {
+    Json(ResolveProjectResponse {
+        project: project::project_identity_for_path(Some(&request.path)),
+    })
 }
 
 async fn peer_session_delta_stream(
@@ -415,14 +510,15 @@ async fn peer_session_delta_stream(
     headers: HeaderMap,
     Query(query): Query<PeerSessionsQuery>,
 ) -> Result<Json<Vec<collaboration::PeerDeltasResponse>>, AppError> {
-    require_peer_token(&headers, state.config.peer_token.as_deref())?;
-    let (sessions, policies) = {
+    let (sessions, policies, token) = {
         let inner = state.inner.read().await;
         (
             inner.sessions.values().cloned().collect::<Vec<_>>(),
             inner.collaboration.project_policies.clone(),
+            effective_local_peer_token(&inner.collaboration, &state.config),
         )
     };
+    require_peer_token(&headers, token.as_deref())?;
     let visible_sessions = collaboration::visible_project_sessions(sessions.iter(), &policies)
         .into_iter()
         .filter(|(session, _, identity)| {
@@ -801,6 +897,7 @@ async fn pair_peer(
         public_key: None,
         base_url: Some(peer_base_url),
         last_seen_at: Some(now),
+        access_token: access_token.clone(),
     };
 
     let mut collaboration = inner.collaboration.clone();
@@ -822,6 +919,35 @@ async fn pair_peer(
     }))
 }
 
+async fn update_trusted_peer_token(
+    Path(peer_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<UpdatePeerAccessTokenRequest>,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    let access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default())
+        .ok_or_else(|| AppError::BadRequest("peerAccessToken must not be empty".to_string()))?;
+
+    let mut inner = state.inner.write().await;
+    let mut collaboration = inner.collaboration.clone();
+    let peer = collaboration
+        .trusted_peers
+        .iter_mut()
+        .find(|peer| peer.peer_id == peer_id)
+        .ok_or_else(|| AppError::NotFound(format!("paired peer '{peer_id}' was not found")))?;
+    peer.access_token = Some(access_token);
+    peer.last_seen_at = Some(Utc::now());
+
+    storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+    inner.collaboration = collaboration.clone();
+
+    Ok(Json(collaboration_state_response(
+        &collaboration,
+        &inner.sessions,
+        &inner.peer_presence,
+        &state.config,
+    )))
+}
+
 async fn trusted_peer_projects(
     Path(peer_id): Path<String>,
     State(state): State<SharedState>,
@@ -841,8 +967,12 @@ async fn trusted_peer_projects(
         .base_url
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
-    let access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default());
+    let access_token = peer_request_token(
+        normalize_optional_text(request.peer_access_token.unwrap_or_default()),
+        &peer,
+    );
     let projects = fetch_peer_projects(peer_base_url, access_token.as_deref()).await?;
+    mark_trusted_peer_seen(&state, &peer_id).await?;
 
     Ok(Json(projects))
 }
@@ -866,7 +996,10 @@ async fn create_subscription(
         .base_url
         .clone()
         .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
-    let peer_access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default());
+    let peer_access_token = peer_request_token(
+        normalize_optional_text(request.peer_access_token.unwrap_or_default()),
+        &peer,
+    );
     let peer_projects = fetch_peer_projects(&peer_base_url, peer_access_token.as_deref()).await?;
     ensure_peer_project_available(&peer_projects, &request.project_id)?;
 
@@ -877,6 +1010,9 @@ async fn create_subscription(
             peer_access_token,
             project_id: request.project_id.clone(),
             peer_id: Some(peer.peer_id.clone()),
+            peer_display_name: Some(peer.display_name.clone()),
+            peer_trusted: Some(peer.trusted),
+            peer_last_seen_at: peer.last_seen_at,
             days: request.days,
             language: request.language,
         },
@@ -884,6 +1020,8 @@ async fn create_subscription(
     .await?;
 
     let now = Utc::now();
+    let analysis_cycle = request.analysis_cycle.unwrap_or_default();
+    let next_run_at = next_run_after(summary.generated_at, &analysis_cycle);
     let topics = normalize_labels(request.topics.unwrap_or_else(|| {
         vec![
             "boundary".to_string(),
@@ -899,6 +1037,11 @@ async fn create_subscription(
         topics,
         created_at: now,
         baseline_generated_at: Some(summary.generated_at),
+        analysis_cycle,
+        next_run_at,
+        last_run_at: Some(summary.generated_at),
+        last_run_status: Some("success".to_string()),
+        last_run_error: None,
     };
 
     let mut inner = state.inner.write().await;
@@ -907,6 +1050,7 @@ async fn create_subscription(
         !(existing.peer_id == subscription.peer_id
             && existing.project_id == subscription.project_id)
     });
+    reset_subscription_delta_cursor(&mut collaboration, &subscription);
     collaboration.subscriptions.push(subscription.clone());
     collaboration
         .summaries
@@ -928,6 +1072,38 @@ async fn create_subscription(
     }))
 }
 
+async fn update_subscription_schedule(
+    Path(subscription_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<UpdateSubscriptionScheduleRequest>,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    let now = Utc::now();
+    let mut inner = state.inner.write().await;
+    let mut collaboration = inner.collaboration.clone();
+    let subscription = collaboration
+        .subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.subscription_id == subscription_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!("subscription '{subscription_id}' was not found"))
+        })?;
+    subscription.analysis_cycle = request.analysis_cycle;
+    subscription.next_run_at = next_run_after(now, &subscription.analysis_cycle);
+    if subscription.analysis_cycle == AnalysisCycle::Manual {
+        subscription.last_run_error = None;
+    }
+
+    storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+    inner.collaboration = collaboration.clone();
+
+    Ok(Json(collaboration_state_response(
+        &collaboration,
+        &inner.sessions,
+        &inner.peer_presence,
+        &state.config,
+    )))
+}
+
 async fn generate_collaboration_baseline(
     State(state): State<SharedState>,
     Json(mut request): Json<collaboration::BaselineSummaryRequest>,
@@ -935,10 +1111,18 @@ async fn generate_collaboration_baseline(
     let sessions = {
         let inner = state.inner.read().await;
         let peer = resolve_paired_baseline_peer(&inner.collaboration, &request)?;
-        request.peer_id = Some(peer.peer_id);
+        request.peer_id = Some(peer.peer_id.clone());
+        request.peer_display_name = Some(peer.display_name.clone());
+        request.peer_trusted = Some(peer.trusted);
+        request.peer_last_seen_at = peer.last_seen_at;
         request.peer_base_url = peer
             .base_url
+            .clone()
             .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
+        request.peer_access_token = peer_request_token(
+            normalize_optional_text(request.peer_access_token.unwrap_or_default()),
+            &peer,
+        );
         inner.sessions.values().cloned().collect::<Vec<_>>()
     };
     let summary = collaboration::generate_baseline_summary(sessions, request).await?;
@@ -961,7 +1145,34 @@ async fn generate_collaboration_incremental(
     State(state): State<SharedState>,
     Json(request): Json<IncrementalSummaryRequest>,
 ) -> Result<Json<IncrementalSummaryResponse>, AppError> {
-    let (sessions, peer, subscription, cursor, active_since) = {
+    Ok(Json(run_incremental_summary(state, request).await?))
+}
+
+pub(crate) async fn run_incremental_summary(
+    state: SharedState,
+    request: IncrementalSummaryRequest,
+) -> Result<IncrementalSummaryResponse, AppError> {
+    if !try_begin_incremental_run(&state, &request.subscription_id) {
+        return Err(AppError::BadRequest(
+            "incremental summary is already running for this subscription".to_string(),
+        ));
+    }
+
+    let subscription_id = request.subscription_id.clone();
+    let result = run_incremental_summary_inner(state.clone(), request).await;
+    if let Err(error) = &result {
+        record_incremental_failure(&state, &subscription_id, error.to_string()).await;
+    }
+    finish_incremental_run(&state, &subscription_id);
+
+    result
+}
+
+async fn run_incremental_summary_inner(
+    state: SharedState,
+    request: IncrementalSummaryRequest,
+) -> Result<IncrementalSummaryResponse, AppError> {
+    let (sessions, peer, subscription, cursor, active_since, previous_summaries) = {
         let inner = state.inner.read().await;
         let subscription = inner
             .collaboration
@@ -991,6 +1202,21 @@ async fn generate_collaboration_incremental(
             .or_else(|| cursor.and_then(|cursor| cursor.last_record_timestamp))
             .or(subscription.baseline_generated_at)
             .unwrap_or_else(|| Utc::now() - Duration::days(1));
+        let mut previous_summaries = inner
+            .collaboration
+            .summaries
+            .iter()
+            .filter(|summary| {
+                summary.project_id == subscription.project_id
+                    && summary
+                        .source_ids
+                        .iter()
+                        .any(|source_id| source_id == &subscription.peer_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        previous_summaries.sort_by(|a, b| b.generated_at.cmp(&a.generated_at));
+        previous_summaries.truncate(8);
 
         (
             inner.sessions.values().cloned().collect::<Vec<_>>(),
@@ -998,13 +1224,17 @@ async fn generate_collaboration_incremental(
             subscription,
             cursor.cloned(),
             active_since,
+            previous_summaries,
         )
     };
     let peer_base_url = peer
         .base_url
         .clone()
         .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
-    let peer_access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default());
+    let peer_access_token = peer_request_token(
+        normalize_optional_text(request.peer_access_token.unwrap_or_default()),
+        &peer,
+    );
     let peer_sessions = fetch_peer_session_summaries(
         &peer_base_url,
         peer_access_token.as_deref(),
@@ -1043,10 +1273,14 @@ async fn generate_collaboration_incremental(
         sessions,
         collaboration::IncrementalSummaryInput {
             peer_id: peer.peer_id.clone(),
+            peer_display_name: Some(peer.display_name.clone()),
             peer_base_url,
+            peer_trusted: peer.trusted,
+            peer_last_seen_at: peer.last_seen_at,
             project_id: subscription.project_id.clone(),
             active_since,
             language: request.language,
+            previous_summaries,
             peer_sessions,
             peer_deltas,
         },
@@ -1073,6 +1307,17 @@ async fn generate_collaboration_incremental(
             updated_at: Utc::now(),
         });
     }
+    let generated_at = summary.generated_at;
+    if let Some(subscription) = collaboration
+        .subscriptions
+        .iter_mut()
+        .find(|item| item.subscription_id == request.subscription_id)
+    {
+        subscription.last_run_at = Some(generated_at);
+        subscription.last_run_status = Some("success".to_string());
+        subscription.last_run_error = None;
+        subscription.next_run_at = next_run_after(generated_at, &subscription.analysis_cycle);
+    }
     storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
     inner.collaboration = collaboration.clone();
     let state_response = collaboration_state_response(
@@ -1082,10 +1327,10 @@ async fn generate_collaboration_incremental(
         &state.config,
     );
 
-    Ok(Json(IncrementalSummaryResponse {
+    Ok(IncrementalSummaryResponse {
         state: state_response,
         summary,
-    }))
+    })
 }
 
 pub fn filter_counts(sessions: &[Session], stale_after_days: i64) -> FilterCounts {
@@ -1172,7 +1417,7 @@ fn find_session_by_public_id<'a>(
 fn require_peer_token(headers: &HeaderMap, configured_token: Option<&str>) -> Result<(), AppError> {
     let Some(configured_token) = configured_token else {
         return Err(AppError::Unauthorized(
-            "CSM_PEER_TOKEN must be set before peer sharing is available".to_string(),
+            "peer token must be configured before peer sharing is available".to_string(),
         ));
     };
     let header_token = headers
@@ -1201,7 +1446,7 @@ fn collaboration_projects(sessions: &[Session]) -> Vec<ProjectIdentity> {
             continue;
         }
 
-        let identity = collaboration::project_identity_for_path(session.project_path.as_deref());
+        let identity = project::project_identity_for_path(session.project_path.as_deref());
         if !projects
             .iter()
             .any(|project| project.project_id == identity.project_id)
@@ -1417,6 +1662,79 @@ fn upsert_trusted_peer(store: &mut CollaborationStore, peer: PeerMetadata) {
         .sort_by(|a, b| a.display_name.cmp(&b.display_name));
 }
 
+fn peer_request_token(request_token: Option<String>, peer: &PeerMetadata) -> Option<String> {
+    request_token.or_else(|| peer.access_token.clone())
+}
+
+pub(crate) fn next_run_after(
+    anchor: chrono::DateTime<Utc>,
+    analysis_cycle: &AnalysisCycle,
+) -> Option<chrono::DateTime<Utc>> {
+    analysis_cycle
+        .duration_minutes()
+        .map(|minutes| anchor + Duration::minutes(minutes))
+}
+
+fn try_begin_incremental_run(state: &SharedState, subscription_id: &str) -> bool {
+    let mut active_runs = state
+        .active_incremental_runs
+        .lock()
+        .expect("incremental run lock poisoned");
+    active_runs.insert(subscription_id.to_string())
+}
+
+fn finish_incremental_run(state: &SharedState, subscription_id: &str) {
+    let mut active_runs = state
+        .active_incremental_runs
+        .lock()
+        .expect("incremental run lock poisoned");
+    active_runs.remove(subscription_id);
+}
+
+async fn record_incremental_failure(state: &SharedState, subscription_id: &str, error: String) {
+    let mut inner = state.inner.write().await;
+    let mut collaboration = inner.collaboration.clone();
+    let Some(subscription) = collaboration
+        .subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.subscription_id == subscription_id)
+    else {
+        return;
+    };
+
+    let now = Utc::now();
+    subscription.last_run_at = Some(now);
+    subscription.last_run_status = Some("failed".to_string());
+    subscription.last_run_error = Some(error.chars().take(500).collect());
+    subscription.next_run_at = next_run_after(now, &subscription.analysis_cycle);
+
+    if let Err(error) =
+        storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)
+    {
+        tracing::warn!("failed to persist scheduled incremental failure: {error}");
+        return;
+    }
+    inner.collaboration = collaboration;
+}
+
+async fn mark_trusted_peer_seen(state: &SharedState, peer_id: &str) -> Result<(), AppError> {
+    let mut inner = state.inner.write().await;
+    let mut collaboration = inner.collaboration.clone();
+    let Some(peer) = collaboration
+        .trusted_peers
+        .iter_mut()
+        .find(|peer| peer.peer_id == peer_id)
+    else {
+        return Ok(());
+    };
+
+    peer.last_seen_at = Some(Utc::now());
+    storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+    inner.collaboration = collaboration;
+
+    Ok(())
+}
+
 fn upsert_peer_source(
     store: &mut CollaborationStore,
     peer: &PeerMetadata,
@@ -1536,6 +1854,13 @@ fn subscription_cursor_path(subscription: &Subscription) -> String {
     format!("subscription:{}", subscription.subscription_id)
 }
 
+fn reset_subscription_delta_cursor(store: &mut CollaborationStore, subscription: &Subscription) {
+    let cursor_path = subscription_cursor_path(subscription);
+    store.delta_cursors.retain(|cursor| {
+        !(cursor.source_id == subscription.peer_id && cursor.session_path == cursor_path)
+    });
+}
+
 fn collaboration_state_response(
     store: &CollaborationStore,
     sessions: &HashMap<String, Session>,
@@ -1562,6 +1887,7 @@ fn local_collaboration_config(
         public_key: None,
         base_url: Some(fallback_base_url.clone()),
         last_seen_at: Some(Utc::now()),
+        access_token: None,
     });
 
     LocalCollaborationConfig {
@@ -1569,14 +1895,29 @@ fn local_collaboration_config(
         display_name: local_peer.display_name,
         base_url: local_peer.base_url.unwrap_or(fallback_base_url),
         bind_address: config.bind_addr.to_string(),
-        peer_token_configured: config.peer_token.is_some(),
-        peer_token: config.peer_token.clone(),
+        peer_token_configured: effective_local_peer_token(store, config).is_some(),
+        peer_token: effective_local_peer_token(store, config),
         lan_discovery_enabled: config.lan_discovery_enabled,
     }
 }
 
+fn effective_local_peer_token(store: &CollaborationStore, config: &Config) -> Option<String> {
+    store
+        .local_peer_token
+        .clone()
+        .or_else(|| config.peer_token.clone())
+        .filter(|token| !token.trim().is_empty())
+}
+
+const DISCOVERED_PEER_TTL_SECONDS: i64 = 30;
+
 fn sorted_peer_presence(peer_presence: &HashMap<String, PeerPresence>) -> Vec<PeerPresence> {
-    let mut peers = peer_presence.values().cloned().collect::<Vec<_>>();
+    let stale_cutoff = Utc::now() - Duration::seconds(DISCOVERED_PEER_TTL_SECONDS);
+    let mut peers = peer_presence
+        .values()
+        .filter(|presence| presence.last_seen_at >= stale_cutoff)
+        .cloned()
+        .collect::<Vec<_>>();
     peers.sort_by(|a, b| {
         b.last_seen_at
             .cmp(&a.last_seen_at)
@@ -1684,6 +2025,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_projects_returns_known_non_deleted_projects() {
+        let temp_dir = unique_temp_dir("list-projects");
+        let alpha_path = temp_dir.join("alpha");
+        let beta_path = temp_dir.join("beta");
+        fs::create_dir_all(&alpha_path).expect("create alpha");
+        fs::create_dir_all(&beta_path).expect("create beta");
+        let alpha_session = test_session(
+            "alpha-1",
+            "Alpha 1",
+            Some(alpha_path.to_string_lossy().to_string()),
+            SessionStatus::Active,
+        );
+        let duplicate_alpha_session = test_session(
+            "alpha-2",
+            "Alpha 2",
+            Some(alpha_path.to_string_lossy().to_string()),
+            SessionStatus::Active,
+        );
+        let deleted_beta_session = test_session(
+            "beta-1",
+            "Beta 1",
+            Some(beta_path.to_string_lossy().to_string()),
+            SessionStatus::Deleted,
+        );
+        let state = test_state(
+            &temp_dir,
+            HashMap::from([
+                (alpha_session.id.clone(), alpha_session),
+                (duplicate_alpha_session.id.clone(), duplicate_alpha_session),
+                (deleted_beta_session.id.clone(), deleted_beta_session),
+            ]),
+        );
+
+        let projects = list_projects(State(state)).await.0;
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path_label, "alpha");
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn resolve_project_returns_project_identity_for_path() {
+        let temp_dir = unique_temp_dir("resolve-project");
+        let project_path = temp_dir.join("resolved-project");
+        fs::create_dir_all(&project_path).expect("create project path");
+
+        let response = resolve_project(Json(ResolveProjectRequest {
+            path: project_path.to_string_lossy().to_string(),
+        }))
+        .await
+        .0;
+
+        assert_eq!(response.project.path_label, "resolved-project");
+        assert_eq!(
+            response.project.root_path.as_deref(),
+            Some(project_path.to_string_lossy().as_ref())
+        );
+        assert!(response.project.project_id.starts_with("project_"));
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
     async fn label_update_does_not_mutate_state_when_metadata_save_fails() {
         let temp_dir = unique_temp_dir("metadata-save-failure");
         let metadata_path = temp_dir.join("metadata.json");
@@ -1718,6 +2123,7 @@ mod tests {
                 stale_after_days: 15,
             },
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -1781,6 +2187,7 @@ mod tests {
                 stale_after_days: 15,
             },
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -1839,6 +2246,7 @@ mod tests {
                 stale_after_days: 15,
             },
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -1852,7 +2260,9 @@ mod tests {
         let response = update_local_collaboration_config(
             State(state.clone()),
             Json(UpdateLocalCollaborationConfigRequest {
-                display_name: "  Team Workstation  ".to_string(),
+                display_name: Some("  Team Workstation  ".to_string()),
+                peer_token: None,
+                refresh_peer_token: None,
             }),
         )
         .await
@@ -1872,6 +2282,64 @@ mod tests {
                 .display_name,
             "Team Workstation"
         );
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn local_collaboration_config_refreshes_persisted_peer_token() {
+        let temp_dir = unique_temp_dir("local-token-refresh");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let state = Arc::new(AppState {
+            config: Config {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 4100)),
+                data_dir: temp_dir.clone(),
+                metadata_path: temp_dir.join("metadata.json"),
+                collaboration_path: temp_dir.join("collaboration.json"),
+                peer_token: Some("token-1".to_string()),
+                lan_discovery_enabled: false,
+                peer_display_name: "Initial".to_string(),
+                archive_dir: temp_dir.join("archive"),
+                max_preview_bytes: 1024,
+                stale_after_days: 15,
+            },
+            lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
+            inner: RwLock::new(AppData {
+                metadata: MetadataFile::default(),
+                collaboration: CollaborationStore {
+                    local_peer_token: Some("token-1".to_string()),
+                    ..CollaborationStore::default()
+                },
+                peer_presence: HashMap::new(),
+                sessions: HashMap::new(),
+                workspace_path: None,
+                stale_after_days: 15,
+            }),
+        });
+
+        let response = update_local_collaboration_config(
+            State(state.clone()),
+            Json(UpdateLocalCollaborationConfigRequest {
+                display_name: None,
+                peer_token: None,
+                refresh_peer_token: Some(true),
+            }),
+        )
+        .await
+        .expect("refresh local peer token")
+        .0;
+
+        let refreshed = response
+            .local_config
+            .peer_token
+            .expect("refreshed peer token");
+        assert_ne!(refreshed, "token-1");
+        assert_eq!(refreshed.len(), 36);
+
+        let stored = storage::load_collaboration_store(&state.config.collaboration_path)
+            .expect("load collaboration store");
+        assert_eq!(stored.local_peer_token.as_deref(), Some(refreshed.as_str()));
 
         fs::remove_dir_all(temp_dir).ok();
     }
@@ -1997,6 +2465,7 @@ mod tests {
                 stale_after_days: 15,
             },
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2034,6 +2503,7 @@ mod tests {
                 stale_after_days: 15,
             },
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2072,6 +2542,12 @@ mod tests {
         assert_eq!(response.peer.display_name, "Discovered Alice");
         assert_eq!(response.peer_projects.len(), 1);
         assert_eq!(response.state.store.trusted_peers.len(), 1);
+        assert_eq!(
+            response.state.store.trusted_peers[0]
+                .access_token
+                .as_deref(),
+            Some("secret")
+        );
         assert_eq!(response.state.store.sources.len(), 1);
 
         server.abort();
@@ -2088,6 +2564,7 @@ mod tests {
             public_key: None,
             base_url: Some("http://127.0.0.1:4001".to_string()),
             last_seen_at: Some(Utc::now()),
+            access_token: None,
         };
         let store = CollaborationStore {
             trusted_peers: vec![trusted_peer],
@@ -2101,6 +2578,9 @@ mod tests {
                 peer_access_token: None,
                 project_id: "project_1".to_string(),
                 peer_id: None,
+                peer_display_name: None,
+                peer_trusted: None,
+                peer_last_seen_at: None,
                 days: None,
                 language: None,
             },
@@ -2115,11 +2595,92 @@ mod tests {
                 peer_access_token: None,
                 project_id: "project_1".to_string(),
                 peer_id: Some("peer_1".to_string()),
+                peer_display_name: None,
+                peer_trusted: None,
+                peer_last_seen_at: None,
                 days: None,
                 language: None,
             },
         );
         assert!(rejected.is_err());
+    }
+
+    #[test]
+    fn peer_request_token_prefers_request_and_falls_back_to_stored_token() {
+        let peer = PeerMetadata {
+            peer_id: "peer_1".to_string(),
+            display_name: "Alice".to_string(),
+            trusted: true,
+            public_key: None,
+            base_url: Some("http://127.0.0.1:4001".to_string()),
+            last_seen_at: Some(Utc::now()),
+            access_token: Some("stored-secret".to_string()),
+        };
+
+        assert_eq!(
+            peer_request_token(Some("request-secret".to_string()), &peer).as_deref(),
+            Some("request-secret")
+        );
+        assert_eq!(
+            peer_request_token(None, &peer).as_deref(),
+            Some("stored-secret")
+        );
+    }
+
+    #[test]
+    fn reset_subscription_delta_cursor_removes_only_matching_subscription_cursor() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 17, 7, 0, 0).unwrap();
+        let subscription = Subscription {
+            subscription_id: "sub_peer_1_project_a".to_string(),
+            peer_id: "peer_1".to_string(),
+            project_id: "project_a".to_string(),
+            status: SubscriptionStatus::Active,
+            topics: Vec::new(),
+            created_at: now,
+            baseline_generated_at: Some(now),
+            analysis_cycle: AnalysisCycle::Hourly,
+            next_run_at: Some(now + Duration::hours(1)),
+            last_run_at: Some(now),
+            last_run_status: Some("success".to_string()),
+            last_run_error: None,
+        };
+        let mut store = CollaborationStore {
+            delta_cursors: vec![
+                SessionDeltaCursor {
+                    source_id: "peer_1".to_string(),
+                    session_path: "subscription:sub_peer_1_project_a".to_string(),
+                    last_offset: 0,
+                    last_record_timestamp: Some(now),
+                    last_record_hash: Some("delta_1".to_string()),
+                    updated_at: now,
+                },
+                SessionDeltaCursor {
+                    source_id: "peer_1".to_string(),
+                    session_path: "subscription:sub_peer_1_project_b".to_string(),
+                    last_offset: 0,
+                    last_record_timestamp: Some(now),
+                    last_record_hash: Some("delta_2".to_string()),
+                    updated_at: now,
+                },
+                SessionDeltaCursor {
+                    source_id: "peer_2".to_string(),
+                    session_path: "subscription:sub_peer_1_project_a".to_string(),
+                    last_offset: 0,
+                    last_record_timestamp: Some(now),
+                    last_record_hash: Some("delta_3".to_string()),
+                    updated_at: now,
+                },
+            ],
+            ..CollaborationStore::default()
+        };
+
+        reset_subscription_delta_cursor(&mut store, &subscription);
+
+        assert_eq!(store.delta_cursors.len(), 2);
+        assert!(store.delta_cursors.iter().all(|cursor| {
+            !(cursor.source_id == "peer_1"
+                && cursor.session_path == "subscription:sub_peer_1_project_a")
+        }));
     }
 
     #[test]
@@ -2169,6 +2730,55 @@ mod tests {
             .expect("system clock before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("csm-api-{prefix}-{}-{stamp}", std::process::id()))
+    }
+
+    fn test_state(temp_dir: &std::path::Path, sessions: HashMap<String, Session>) -> SharedState {
+        Arc::new(AppState {
+            config: Config {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                data_dir: temp_dir.to_path_buf(),
+                metadata_path: temp_dir.join("metadata.json"),
+                collaboration_path: temp_dir.join("collaboration.json"),
+                peer_token: None,
+                lan_discovery_enabled: false,
+                peer_display_name: "Test".to_string(),
+                archive_dir: temp_dir.join("archive"),
+                max_preview_bytes: 1024,
+                stale_after_days: 15,
+            },
+            lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
+            inner: RwLock::new(AppData {
+                metadata: MetadataFile::default(),
+                collaboration: CollaborationStore::default(),
+                peer_presence: HashMap::new(),
+                sessions,
+                workspace_path: Some(temp_dir.to_string_lossy().to_string()),
+                stale_after_days: 15,
+            }),
+        })
+    }
+
+    fn test_session(
+        id: &str,
+        name: &str,
+        project_path: Option<String>,
+        status: SessionStatus,
+    ) -> Session {
+        Session {
+            id: id.to_string(),
+            codex_session_id: None,
+            name: name.to_string(),
+            excerpt: "excerpt".to_string(),
+            full_content: "content".to_string(),
+            path: format!("/tmp/{id}.md"),
+            project_path,
+            labels: Vec::new(),
+            last_modified: Utc::now(),
+            size: 7,
+            status,
+            notes: String::new(),
+        }
     }
 
     fn test_delta(id: &str, timestamp: chrono::DateTime<Utc>) -> crate::models::SessionDelta {

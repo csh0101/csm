@@ -1,6 +1,6 @@
-# Codex Session Manager Frontend
+# Traceway Frontend
 
-React + Vite frontend for the Codex Session Manager. The same UI runs in two modes:
+React + Vite frontend for Traceway. The same UI runs in two modes:
 
 - Browser mode: `npm run dev`, using the Rust HTTP backend through `/api`.
 - Desktop mode: `npm run tauri:dev`, using Tauri commands from `src-tauri`.

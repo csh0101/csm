@@ -289,6 +289,10 @@ fn get_collaboration_api_base_url(state: tauri::State<'_, SharedState>) -> Strin
 
 fn config_for_tauri(app: &tauri::App) -> Result<Config, String> {
     let mut config = Config::from_env();
+    if env::var_os("CSM_LAN_DISCOVERY").is_none() {
+        config.lan_discovery_enabled = true;
+    }
+
     if env::var_os("CSM_DATA_DIR").is_none() {
         let data_dir = app.path().app_data_dir().map_err(error_message)?;
         config.data_dir = data_dir.clone();
@@ -311,6 +315,8 @@ struct LocalApiBinding {
 fn bind_local_api(config: &mut Config) -> Result<LocalApiBinding, String> {
     let requested_addr = if env::var_os("CSM_BIND_ADDR").is_some() {
         config.bind_addr
+    } else if config.lan_discovery_enabled {
+        SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
         SocketAddr::from(([127, 0, 0, 1], 0))
     };
@@ -390,6 +396,10 @@ pub fn run() {
             let binding = bind_local_api(&mut config).map_err(AppError::BadRequest)?;
             let state = AppState::new(config)?;
             let api_state = Arc::clone(&state);
+            let scheduler_state = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                backend::scheduler::run(scheduler_state).await;
+            });
             tauri::async_runtime::spawn(async move {
                 if let Err(error) =
                     backend::server::serve_std_listener(api_state, binding.listener).await

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     sync::{Arc, Mutex},
 };
@@ -21,6 +21,7 @@ pub struct AppState {
     pub config: Config,
     pub inner: RwLock<AppData>,
     pub lan_discovery: Mutex<Option<LanDiscoveryHandle>>,
+    pub active_incremental_runs: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +54,7 @@ impl AppState {
             peer_display_name,
             format!("http://{}", config.bind_addr),
         );
+        collaboration::ensure_local_peer_token(&mut collaboration, config.peer_token.clone());
         storage::save_collaboration_store(&config.collaboration_path, &collaboration)?;
         let stale_after_days = metadata
             .stale_after_days
@@ -85,6 +87,7 @@ impl AppState {
         let state = Arc::new(Self {
             config,
             lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
             inner: RwLock::new(AppData {
                 metadata,
                 collaboration,
@@ -95,13 +98,17 @@ impl AppState {
             }),
         });
 
-        if let Some(discovery) =
-            discovery::start(state.clone(), local_peer.peer_id, local_peer.display_name)?
-        {
-            *state
-                .lan_discovery
-                .lock()
-                .expect("LAN discovery lock poisoned") = Some(discovery);
+        match discovery::start(state.clone(), local_peer.peer_id, local_peer.display_name) {
+            Ok(Some(discovery)) => {
+                *state
+                    .lan_discovery
+                    .lock()
+                    .expect("LAN discovery lock poisoned") = Some(discovery);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("failed to start LAN discovery: {error}");
+            }
         }
 
         Ok(state)

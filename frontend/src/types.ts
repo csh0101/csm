@@ -83,6 +83,10 @@ export interface ProjectIdentity {
   gitBranch?: string | null;
 }
 
+export interface ResolveProjectResponse {
+  project: ProjectIdentity;
+}
+
 export interface SharePolicy {
   projectId: string;
   projectPath?: string | null;
@@ -111,6 +115,7 @@ export interface PeerMetadata {
   publicKey?: string | null;
   baseUrl?: string | null;
   lastSeenAt?: string | null;
+  accessToken?: string | null;
 }
 
 export interface PeerProject {
@@ -139,6 +144,11 @@ export interface Subscription {
   topics: string[];
   createdAt: string;
   baselineGeneratedAt?: string | null;
+  analysisCycle: '10m' | '1h' | 'manual';
+  nextRunAt?: string | null;
+  lastRunAt?: string | null;
+  lastRunStatus?: string | null;
+  lastRunError?: string | null;
 }
 
 export interface CollaborationStore {

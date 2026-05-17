@@ -2,7 +2,7 @@ import React from 'react';
 import { FilterType } from '../types';
 import { useI18n } from '../i18n';
 import { 
-  LayoutGrid, Clock, AlertCircle, Trash2, Users
+  LayoutGrid, Trash2, Users
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { FilterCounts } from '../types';
@@ -23,10 +23,9 @@ interface NavItemProps {
   isActive?: boolean;
   onClick: () => void;
   isDanger?: boolean;
-  isStale?: boolean;
 }
 
-function NavItem({ icon: Icon, label, count, isActive, onClick, isDanger, isStale }: NavItemProps) {
+function NavItem({ icon: Icon, label, count, isActive, onClick, isDanger }: NavItemProps) {
   return (
     <button
       onClick={onClick}
@@ -41,14 +40,13 @@ function NavItem({ icon: Icon, label, count, isActive, onClick, isDanger, isStal
       <div className="flex items-center gap-3">
         <Icon className={cn(
           "w-4 h-4", 
-          isDanger ? "text-red-400" : isStale ? "text-amber-500" : (isActive ? "text-white" : "text-slate-400")
+          isDanger ? "text-red-400" : (isActive ? "text-white" : "text-slate-400")
         )} />
-        <span className={cn(!isActive && !isDanger && !isStale && "text-slate-300")}>{label}</span>
+        <span className={cn(!isActive && !isDanger && "text-slate-300")}>{label}</span>
       </div>
       {count !== undefined && (
         <span className={cn(
           "text-[10px] px-1.5 rounded",
-          isStale ? "bg-amber-500/20 text-amber-500" : 
           isActive ? "bg-slate-700 text-slate-300" : 
           "bg-slate-700 text-slate-400"
         )}>
@@ -76,7 +74,6 @@ export function Sidebar({ activeView, currentFilter, onSelectFilter, onSelectCol
       </div>
 
       <nav className="flex-1 py-2 space-y-1 overflow-y-auto md:py-4">
-        <div className="px-6 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">{t('nav_navigation')}</div>
         <NavItem 
           icon={LayoutGrid} 
           label={t('nav_explorer')} 
@@ -89,23 +86,6 @@ export function Sidebar({ activeView, currentFilter, onSelectFilter, onSelectCol
           label={t('nav_collaboration')}
           isActive={activeView === 'collaboration'}
           onClick={onSelectCollaboration}
-        />
-        <NavItem 
-          icon={Clock} 
-          label={t('nav_recent')} 
-          count={counts.recent}
-          isActive={activeView === 'sessions' && currentFilter === 'recent'}
-          onClick={() => onSelectFilter('recent')} 
-        />
-        
-        <div className="px-6 mt-6 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">{t('nav_smart_filters')}</div>
-        <NavItem 
-          icon={AlertCircle} 
-          label={t('nav_stale')} 
-          isStale
-          count={counts.stale}
-          isActive={activeView === 'sessions' && currentFilter === 'stale'}
-          onClick={() => onSelectFilter('stale')} 
         />
       </nav>
 

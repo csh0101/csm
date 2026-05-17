@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { MainList } from './components/MainList';
 import { PreviewPanel } from './components/PreviewPanel';
@@ -17,8 +17,10 @@ import {
   labelFromFilter,
   projectPathFromFilter,
 } from './types';
-import { subDays } from 'date-fns';
+import { formatDistanceToNow, subDays } from 'date-fns';
 import { useI18n } from './i18n';
+import { Bell, CheckCircle, X } from 'lucide-react';
+import { cn } from './lib/utils';
 import {
   archiveDeleteSession,
   createCollaborationSubscription,
@@ -31,6 +33,8 @@ import {
   restoreSession,
   scanSessions,
   updateLocalCollaborationConfig,
+  updatePeerAccessToken,
+  updateSubscriptionSchedule,
   updateSharePolicy,
   updateSessionLabels,
   updateSessionNotes,
@@ -38,6 +42,22 @@ import {
 } from './api';
 
 const DEFAULT_STALE_AFTER_DAYS = 15;
+
+type NotificationTaskResult = {
+  time: string;
+  status: 'success' | 'failed';
+  result: string;
+};
+
+type AppNotification = {
+  id: string;
+  title: string;
+  message: string;
+  time: string;
+  sortTime: number;
+  unread: boolean;
+  taskResult: NotificationTaskResult;
+};
 
 function normalizePeerBaseUrl(value: string) {
   const trimmed = value.trim().replace(/\/+$/, '');
@@ -69,6 +89,7 @@ export default function App() {
   const [peerBaseUrl, setPeerBaseUrl] = useState('');
   const [peerAccessToken, setPeerAccessToken] = useState('');
   const [selectedPeerId, setSelectedPeerId] = useState('');
+  const selectedPeerIdRef = useRef('');
   const [peerProjects, setPeerProjects] = useState<PeerProject[]>([]);
   const [collaborationProjectId, setCollaborationProjectId] = useState('');
   const [collaborationSummaryDays, setCollaborationSummaryDays] = useState(7);
@@ -76,11 +97,22 @@ export default function App() {
   const [isPairingPeer, setIsPairingPeer] = useState(false);
   const [isLoadingPeerProjects, setIsLoadingPeerProjects] = useState(false);
   const [isSavingSharePolicy, setIsSavingSharePolicy] = useState(false);
-  const [isGeneratingCollaboration, setIsGeneratingCollaboration] = useState(false);
+  const [isUpdatingPeerToken, setIsUpdatingPeerToken] = useState(false);
+  const [isRefreshingLocalToken, setIsRefreshingLocalToken] = useState(false);
+  const [generatingCollaborationProjectIds, setGeneratingCollaborationProjectIds] = useState<string[]>([]);
+  const generatingCollaborationProjectIdsRef = useRef<Set<string>>(new Set());
   const [isRefreshingCollaboration, setIsRefreshingCollaboration] = useState(false);
   const [latestCollaborationSummary, setLatestCollaborationSummary] = useState<CollaborationSummary | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
+  const appStartedAtRef = useRef(Date.now());
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [readNotificationIds, setReadNotificationIds] = useState<string[]>([]);
+  const [selectedTaskResult, setSelectedTaskResult] = useState<NotificationTaskResult | null>(null);
+
+  useEffect(() => {
+    selectedPeerIdRef.current = selectedPeerId;
+  }, [selectedPeerId]);
 
   const applySessionsResponse = (response: SessionsResponse) => {
     setSessions(response.sessions);
@@ -93,22 +125,25 @@ export default function App() {
     }
   };
 
-  const loadProjectsForPeer = async (
+  const loadProjectsForPeer = useCallback(async (
     peerId: string,
     peers: CollaborationStateResponse['store']['trustedPeers'],
-    reportErrors = true
+    reportErrors = true,
+    showLoading = true
   ) => {
     const peer = peers.find((item) => item.peerId === peerId);
     if (!peer?.baseUrl) return;
 
     setPeerBaseUrl(peer.baseUrl);
-    setIsLoadingPeerProjects(true);
+    if (showLoading) {
+      setIsLoadingPeerProjects(true);
+    }
     if (reportErrors) {
       setErrorMessage(null);
       setNoticeMessage(null);
     }
     try {
-      const projects = await fetchCollaborationPeerProjects(peerId, peerAccessToken.trim() || undefined);
+      const projects = await fetchCollaborationPeerProjects(peerId);
       setPeerProjects(projects);
       setCollaborationProjectId(projects[0]?.projectId || '');
     } catch (error) {
@@ -116,9 +151,11 @@ export default function App() {
         setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_projects_failed'));
       }
     } finally {
-      setIsLoadingPeerProjects(false);
+      if (showLoading) {
+        setIsLoadingPeerProjects(false);
+      }
     }
-  };
+  }, [t]);
 
   useEffect(() => {
     let isMounted = true;
@@ -139,27 +176,43 @@ export default function App() {
     };
   }, []);
 
-  const loadCollaborationState = async () => {
-    setIsCollaborationLoading(true);
+  const loadCollaborationState = useCallback(async (showLoading = true) => {
+    if (showLoading) {
+      setIsCollaborationLoading(true);
+    }
     try {
       const response = await fetchCollaborationState();
-      const nextSelectedPeerId = selectedPeerId || response.store.trustedPeers[0]?.peerId || '';
+      const nextSelectedPeerId = selectedPeerIdRef.current || response.store.trustedPeers[0]?.peerId || '';
       setCollaborationState(response);
       setCollaborationProjectId((current) => current || response.projects[0]?.projectId || '');
+      selectedPeerIdRef.current = nextSelectedPeerId;
       setSelectedPeerId(nextSelectedPeerId);
       if (nextSelectedPeerId) {
-        void loadProjectsForPeer(nextSelectedPeerId, response.store.trustedPeers, false);
+        void loadProjectsForPeer(nextSelectedPeerId, response.store.trustedPeers, false, false);
       }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_load_failed'));
     } finally {
-      setIsCollaborationLoading(false);
+      if (showLoading) {
+        setIsCollaborationLoading(false);
+      }
     }
-  };
+  }, [loadProjectsForPeer, t]);
 
   useEffect(() => {
     void loadCollaborationState();
-  }, []);
+  }, [loadCollaborationState]);
+
+  useEffect(() => {
+    if (activeView !== 'collaboration') return;
+
+    void loadCollaborationState();
+    const refreshId = window.setInterval(() => {
+      void loadCollaborationState(false);
+    }, 3000);
+
+    return () => window.clearInterval(refreshId);
+  }, [activeView, loadCollaborationState]);
 
   // Derived state
   const { filteredSessions, counts } = useMemo(() => {
@@ -362,6 +415,45 @@ export default function App() {
     }
   };
 
+  const handleRefreshLocalPeerToken = async () => {
+    setIsRefreshingLocalToken(true);
+    setErrorMessage(null);
+    setNoticeMessage(null);
+    try {
+      const response = await updateLocalCollaborationConfig({ refreshPeerToken: true });
+      setCollaborationState(response);
+      setNoticeMessage(t('collab_local_token_refreshed'));
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+    } finally {
+      setIsRefreshingLocalToken(false);
+    }
+  };
+
+  const handleUpdatePeerAccessToken = async (peerId: string, token: string) => {
+    const trimmed = token.trim();
+    if (!trimmed) return;
+
+    setIsUpdatingPeerToken(true);
+    setErrorMessage(null);
+    setNoticeMessage(null);
+    try {
+      const response = await updatePeerAccessToken(peerId, trimmed);
+      setCollaborationState(response);
+      setPeerAccessToken('');
+      if (peerId === selectedPeerId) {
+        const projects = await fetchCollaborationPeerProjects(peerId);
+        setPeerProjects(projects);
+        setCollaborationProjectId(projects[0]?.projectId || '');
+      }
+      setNoticeMessage(t('collab_peer_token_saved'));
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+    } finally {
+      setIsUpdatingPeerToken(false);
+    }
+  };
+
   const handlePairPeer = async () => {
     if (!peerBaseUrl.trim()) return;
 
@@ -377,7 +469,9 @@ export default function App() {
       });
       setCollaborationState(response.state);
       setPeerProjects(response.peerProjects);
+      selectedPeerIdRef.current = response.peer.peerId;
       setSelectedPeerId(response.peer.peerId);
+      setPeerAccessToken('');
       setNoticeMessage(t('collab_peer_paired'));
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_pair_failed'));
@@ -388,23 +482,32 @@ export default function App() {
 
   const handleUseDiscoveredPeer = (peer: PeerPresence) => {
     setPeerBaseUrl(peer.baseUrl);
+    selectedPeerIdRef.current = '';
     setSelectedPeerId('');
     setPeerProjects([]);
   };
 
   const handleSelectPeer = async (peerId: string) => {
+    selectedPeerIdRef.current = peerId;
     setSelectedPeerId(peerId);
     setCollaborationProjectId('');
     setPeerProjects([]);
     await loadProjectsForPeer(peerId, collaborationState?.store.trustedPeers ?? []);
   };
 
-  const handleCreateCollaborationSubscription = async (projectId?: string) => {
+  const handleCreateCollaborationSubscription = async (
+    projectId?: string,
+    analysisCycle: '10m' | '1h' | 'manual' = '1h'
+  ) => {
     const targetProjectId = projectId || collaborationProjectId;
     if (!targetProjectId || (!selectedPeerId && !peerBaseUrl.trim())) return;
+    if (generatingCollaborationProjectIdsRef.current.has(targetProjectId)) return;
 
+    generatingCollaborationProjectIdsRef.current.add(targetProjectId);
     setCollaborationProjectId(targetProjectId);
-    setIsGeneratingCollaboration(true);
+    setGeneratingCollaborationProjectIds((current) =>
+      current.includes(targetProjectId) ? current : [...current, targetProjectId]
+    );
     setErrorMessage(null);
     setNoticeMessage(null);
     try {
@@ -419,16 +522,19 @@ export default function App() {
         projectId: targetProjectId,
         days: collaborationSummaryDays,
         language: lang,
+        analysisCycle,
       });
       setCollaborationState(response.state);
       setLatestCollaborationSummary(response.summary);
+      selectedPeerIdRef.current = response.subscription.peerId;
       setSelectedPeerId(response.subscription.peerId);
       setCollaborationProjectId(response.subscription.projectId);
       setNoticeMessage(t('collab_subscription_created'));
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_summary_failed'));
     } finally {
-      setIsGeneratingCollaboration(false);
+      generatingCollaborationProjectIdsRef.current.delete(targetProjectId);
+      setGeneratingCollaborationProjectIds((current) => current.filter((id) => id !== targetProjectId));
     }
   };
 
@@ -454,6 +560,21 @@ export default function App() {
       setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_incremental_failed'));
     } finally {
       setIsRefreshingCollaboration(false);
+    }
+  };
+
+  const handleUpdateSubscriptionSchedule = async (
+    subscriptionId: string,
+    analysisCycle: '10m' | '1h' | 'manual'
+  ) => {
+    setErrorMessage(null);
+    setNoticeMessage(null);
+    try {
+      const response = await updateSubscriptionSchedule(subscriptionId, analysisCycle);
+      setCollaborationState(response);
+      setNoticeMessage(t('collab_schedule_saved'));
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
     }
   };
 
@@ -573,8 +694,70 @@ export default function App() {
         unlabeled: t('filter_unlabeled')
       }[currentFilter] || t('filter_all'));
 
+  const notifications = useMemo<AppNotification[]>(() => {
+    const projectLabelById = new Map(
+      (collaborationState?.projects ?? []).map((project) => [project.projectId, project.pathLabel])
+    );
+    const readIds = new Set(readNotificationIds);
+    const items: AppNotification[] = (collaborationState?.store.summaries ?? []).map((summary) => {
+      const generatedAt = new Date(summary.generatedAt);
+      const generatedTime = generatedAt.getTime();
+      const projectLabel = projectLabelById.get(summary.projectId) ?? summary.projectId;
+      const isBaseline = summary.engine === 'codex-exec';
+      const id = `summary:${summary.summaryId}`;
+
+      return {
+        id,
+        title: isBaseline ? t('notification_baseline_completed') : t('notification_incremental_completed'),
+        message: t('notification_analysis_message', { project: projectLabel }),
+        time: Number.isFinite(generatedTime)
+          ? formatDistanceToNow(generatedAt, { addSuffix: true })
+          : '',
+        sortTime: Number.isFinite(generatedTime) ? generatedTime : 0,
+        unread: generatedTime > appStartedAtRef.current && !readIds.has(id),
+        taskResult: {
+          time: Number.isFinite(generatedTime) ? generatedAt.toLocaleString() : summary.generatedAt,
+          status: 'success',
+          result: summary.markdown,
+        },
+      };
+    });
+
+    if (activitySummary) {
+      const generatedAt = new Date(activitySummary.generatedAt);
+      const generatedTime = generatedAt.getTime();
+      const id = `activity:${activitySummary.generatedAt}`;
+      items.push({
+        id,
+        title: t('activity_summary_title'),
+        message: t('notification_activity_message', { count: activitySummary.includedSessionCount }),
+        time: Number.isFinite(generatedTime)
+          ? formatDistanceToNow(generatedAt, { addSuffix: true })
+          : '',
+        sortTime: Number.isFinite(generatedTime) ? generatedTime : 0,
+        unread: generatedTime > appStartedAtRef.current && !readIds.has(id),
+        taskResult: {
+          time: Number.isFinite(generatedTime) ? generatedAt.toLocaleString() : activitySummary.generatedAt,
+          status: 'success',
+          result: activitySummary.summary,
+        },
+      });
+    }
+
+    return items.sort((a, b) => b.sortTime - a.sortTime);
+  }, [activitySummary, collaborationState?.projects, collaborationState?.store.summaries, readNotificationIds, t]);
+  const unreadNotificationCount = notifications.filter((notification) => notification.unread).length;
+
+  const handleNotificationClick = (notification: AppNotification) => {
+    setReadNotificationIds((current) =>
+      current.includes(notification.id) ? current : [...current, notification.id]
+    );
+    setSelectedTaskResult(notification.taskResult);
+    setShowNotifications(false);
+  };
+
   return (
-    <div className="flex h-screen w-full flex-col overflow-hidden bg-[#F1F5F9] font-sans text-slate-900 md:flex-row">
+    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-[#F1F5F9] font-sans text-slate-900 md:flex-row">
       <Sidebar 
         activeView={activeView}
         currentFilter={currentFilter}
@@ -582,6 +765,61 @@ export default function App() {
         onSelectCollaboration={() => { setActiveView('collaboration'); setFocusedId(null); }}
         counts={counts}
       />
+
+      <div className="absolute top-3 right-4 z-50 flex items-center md:right-6">
+        <button
+          type="button"
+          onClick={() => setShowNotifications((current) => !current)}
+          className="relative rounded-full border border-slate-200 bg-white p-2 text-slate-500 shadow-sm transition-colors hover:bg-slate-100 hover:text-slate-700"
+          title={t('notifications')}
+          aria-label={t('notifications')}
+        >
+          <Bell className="h-5 w-5" />
+          {unreadNotificationCount > 0 && (
+            <span className="absolute top-1 right-1 h-2.5 w-2.5 rounded-full border-2 border-white bg-red-500"></span>
+          )}
+        </button>
+
+        {showNotifications && (
+          <div className="absolute top-full right-0 mt-2 w-80 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-4 py-3">
+              <h3 className="text-sm font-bold text-slate-800">{t('notifications')}</h3>
+              {unreadNotificationCount > 0 && (
+                <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-600">
+                  {unreadNotificationCount} {t('notification_new')}
+                </span>
+              )}
+            </div>
+            <div className="max-h-[300px] overflow-y-auto">
+              {notifications.length > 0 ? (
+                notifications.map((notification) => (
+                  <button
+                    key={notification.id}
+                    type="button"
+                    onClick={() => handleNotificationClick(notification)}
+                    className={cn(
+                      'w-full border-b border-slate-50 p-4 text-left transition-colors last:border-0 hover:bg-slate-50',
+                      notification.unread && 'bg-blue-50/30'
+                    )}
+                  >
+                    <div className="mb-1 flex items-start justify-between gap-3">
+                      <h4 className={cn('text-sm font-semibold', notification.unread ? 'text-slate-900' : 'text-slate-700')}>
+                        {notification.title}
+                      </h4>
+                      <span className="shrink-0 font-mono text-[10px] text-slate-400">{notification.time}</span>
+                    </div>
+                    <p className="text-xs leading-relaxed text-slate-500">{notification.message}</p>
+                  </button>
+                ))
+              ) : (
+                <div className="px-4 py-8 text-center text-sm text-slate-400">
+                  {t('notification_empty')}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
 
       {activeView === 'sessions' ? (
         <>
@@ -595,6 +833,14 @@ export default function App() {
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
             currentFilterText={filterTitle}
+            isStaleFilterActive={currentFilter === 'stale'}
+            staleSessionCount={counts.stale}
+            onToggleStaleFilter={() => {
+              setActiveView('sessions');
+              setCurrentFilter(currentFilter === 'stale' ? 'all' : 'stale');
+              setSelectedIds(new Set());
+              setFocusedId(null);
+            }}
             workspacePath={workspacePath}
             onWorkspacePathChange={setWorkspacePath}
             onScan={handleScan}
@@ -659,18 +905,84 @@ export default function App() {
           isLoading={isCollaborationLoading}
           isPairingPeer={isPairingPeer}
           isLoadingPeerProjects={isLoadingPeerProjects}
-          isGenerating={isGeneratingCollaboration}
+          isUpdatingPeerToken={isUpdatingPeerToken}
+          isRefreshingLocalToken={isRefreshingLocalToken}
+          generatingProjectIds={generatingCollaborationProjectIds}
           isRefreshingIncremental={isRefreshingCollaboration}
           onRefresh={loadCollaborationState}
           onLocalDisplayNameChange={handleUpdateLocalDisplayName}
+          onRefreshLocalPeerToken={handleRefreshLocalPeerToken}
+          onUpdatePeerAccessToken={handleUpdatePeerAccessToken}
           onPairPeer={handlePairPeer}
           onUseDiscoveredPeer={handleUseDiscoveredPeer}
           onCreateSubscription={handleCreateCollaborationSubscription}
           onGenerateIncremental={handleGenerateCollaborationIncremental}
+          onUpdateSubscriptionSchedule={handleUpdateSubscriptionSchedule}
           latestSummary={latestCollaborationSummary}
           errorMessage={errorMessage}
           noticeMessage={noticeMessage}
         />
+      )}
+
+      {selectedTaskResult && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-sm"
+          onClick={() => setSelectedTaskResult(null)}
+        >
+          <div
+            className="flex max-h-[84vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-5 py-4">
+              <h3 className="flex items-center gap-2 text-lg font-bold text-slate-800">
+                <CheckCircle className={cn('h-5 w-5', selectedTaskResult.status === 'success' ? 'text-emerald-500' : 'text-red-500')} />
+                {t('collab_task_detail_title')}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setSelectedTaskResult(null)}
+                className="rounded-md p-1.5 text-slate-400 transition-colors hover:bg-slate-200 hover:text-slate-600"
+                title={t('collab_close')}
+                aria-label={t('collab_close')}
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="border-b border-slate-100 bg-slate-50/50 px-6 py-3">
+              <div className="flex flex-wrap items-center gap-6 text-sm">
+                <div>
+                  <span className="mr-2 font-medium text-slate-400">{t('collab_task_time')}:</span>
+                  <span className="font-mono text-slate-700">{selectedTaskResult.time}</span>
+                </div>
+                <div>
+                  <span className="mr-2 font-medium text-slate-400">{t('collab_task_status')}:</span>
+                  <span
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-sm px-2 py-0.5 text-xs font-bold uppercase tracking-wider',
+                      selectedTaskResult.status === 'success' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'
+                    )}
+                  >
+                    {selectedTaskResult.status === 'success' ? t('collab_status_success') : t('collab_status_failed')}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="overflow-y-auto bg-white p-6">
+              <pre className="whitespace-pre-wrap font-mono text-sm font-medium leading-relaxed text-slate-700">
+                {selectedTaskResult.result}
+              </pre>
+            </div>
+            <div className="flex justify-end border-t border-slate-100 bg-slate-50 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => setSelectedTaskResult(null)}
+                className="rounded-lg border border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:bg-slate-50"
+              >
+                {t('collab_close')}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

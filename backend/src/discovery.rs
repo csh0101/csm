@@ -2,7 +2,6 @@ use std::{collections::HashMap, net::IpAddr, net::Ipv4Addr, thread};
 
 use chrono::Utc;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
-use tokio::runtime::Handle;
 
 use crate::{error::AppError, models::PeerPresence, state::SharedState};
 
@@ -38,7 +37,6 @@ pub fn start(
         .map_err(|error| AppError::External(format!("failed to browse LAN peers: {error}")))?;
     let service_fullname =
         register_local_presence(&daemon, &state, &local_peer_id, local_display_name)?;
-    let runtime = Handle::current();
     thread::Builder::new()
         .name("csm-mdns-discovery".to_string())
         .spawn(move || {
@@ -51,22 +49,16 @@ pub fn start(
                         if presence.peer_id == local_peer_id {
                             continue;
                         }
-                        let state = state.clone();
-                        runtime.spawn(async move {
-                            let mut inner = state.inner.write().await;
-                            inner
-                                .peer_presence
-                                .insert(presence.peer_id.clone(), presence);
-                        });
+                        let mut inner = state.inner.blocking_write();
+                        inner
+                            .peer_presence
+                            .insert(presence.peer_id.clone(), presence);
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        let state = state.clone();
-                        runtime.spawn(async move {
-                            let mut inner = state.inner.write().await;
-                            inner
-                                .peer_presence
-                                .retain(|_, presence| presence.service_name != fullname);
-                        });
+                        let mut inner = state.inner.blocking_write();
+                        inner
+                            .peer_presence
+                            .retain(|_, presence| presence.service_name != fullname);
                     }
                     _ => {}
                 }
@@ -155,7 +147,7 @@ fn sanitize_instance_name(value: &str) -> String {
     let sanitized = sanitized.trim_matches('-');
 
     if sanitized.is_empty() {
-        "codex-session-manager".to_string()
+        "traceway".to_string()
     } else {
         sanitized.chars().take(40).collect()
     }
@@ -168,7 +160,7 @@ mod tests {
     #[test]
     fn discovery_instance_name_is_ascii_and_bounded() {
         assert_eq!(sanitize_instance_name("Alice MacBook"), "Alice-MacBook");
-        assert_eq!(sanitize_instance_name("  "), "codex-session-manager");
+        assert_eq!(sanitize_instance_name("  "), "traceway");
         assert!(sanitize_instance_name(&"a".repeat(80)).len() <= 40);
     }
 }

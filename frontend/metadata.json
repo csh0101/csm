@@ -1,6 +1,6 @@
 {
-  "name": "Codex Session Manager",
-  "description": "A lightweight, responsive workspace console for deeply cleaning and organizing local Codex sessions.",
+  "name": "Traceway",
+  "description": "A lightweight, responsive workspace console for AI work trails, collaboration context, and handoff reports.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }

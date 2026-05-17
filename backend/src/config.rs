@@ -35,7 +35,7 @@ impl Config {
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
-        let lan_discovery_enabled = env_flag("CSM_LAN_DISCOVERY", true);
+        let lan_discovery_enabled = env_flag("CSM_LAN_DISCOVERY", false);
         let peer_display_name = env::var("CSM_PEER_DISPLAY_NAME")
             .ok()
             .map(|name| name.trim().to_string())
@@ -89,7 +89,7 @@ fn default_peer_display_name() -> String {
         .ok()
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Codex Session Manager".to_string())
+        .unwrap_or_else(|| "Traceway".to_string())
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
