@@ -216,6 +216,9 @@ pub async fn readdir_virtual<C: MysqlConnector>(
             Ok(indexes
                 .into_iter()
                 .filter(|index| index.columns.len() == 1)
+                .filter(|index| {
+                    !crate::mounts::policy::is_sensitive_column(&context.policy, &index.columns[0])
+                })
                 .filter(|index| match *lookup_dir {
                     "by-primary" => index.primary,
                     "by-unique" => index.unique && !index.primary,
@@ -380,6 +383,7 @@ async fn render_lookup<C: MysqlConnector>(
     let allowed = indexes.iter().any(|index| {
         index.columns.len() == 1
             && index.columns[0] == lookup.column
+            && !crate::mounts::policy::is_sensitive_column(&context.policy, &lookup.column)
             && match lookup.kind {
                 LookupKind::Primary => index.primary,
                 LookupKind::Unique => index.unique && !index.primary,
@@ -579,6 +583,37 @@ mod tests {
         .expect_err("primary key should not be accepted under by-unique");
 
         assert!(error.to_string().contains("lookup by 'id' is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn sensitive_index_columns_are_not_listed_or_authorized_for_lookup() {
+        let context = test_context();
+        let connector = MockConnector;
+        let cache = MountCache::default();
+
+        let unique_columns = readdir_virtual(
+            &context,
+            &connector,
+            "schemas/app/tables/users/lookup/by-unique",
+        )
+        .await
+        .expect("readdir lookup columns");
+        assert!(!unique_columns.contains(&"email".to_string()));
+
+        let error = read_virtual_file(
+            &context,
+            &connector,
+            &cache,
+            "schemas/app/tables/users/lookup/by-unique/email/alice@example.com.json",
+        )
+        .await
+        .expect_err("sensitive lookup should be blocked");
+
+        assert!(
+            error
+                .to_string()
+                .contains("lookup by 'email' is not allowed")
+        );
     }
 
     #[tokio::test]
