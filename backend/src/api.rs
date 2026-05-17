@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path as FsPath, PathBuf};
 
 use axum::{
     Json, Router,
@@ -20,6 +21,15 @@ use crate::{
         CollaborationStore, CollaborationSummary, FilterCounts, LabelCount, MetadataFile,
         PeerMetadata, PeerPresence, ProjectIdentity, Session, SessionDeltaCursor, SessionMeta,
         SessionStatus, SharePolicy, Subscription, SubscriptionStatus,
+    },
+    mounts::{
+        fuse,
+        models::{
+            ConnectorKind, CredentialProfile, CredentialSecret, MountPolicy, MountRecord,
+            MountStatus, MountStore, MysqlDiscoveryCandidate,
+        },
+        mysql::{self, LiveMysqlConnector, MysqlConnector},
+        storage as mount_storage,
     },
     project, scanner,
     state::SharedState,
@@ -116,6 +126,72 @@ pub struct ResolveProjectRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ResolveProjectResponse {
     pub project: ProjectIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverMysqlMountRequest {
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverMysqlMountResponse {
+    pub project_id: String,
+    pub candidates: Vec<MysqlDiscoveryCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMountRequest {
+    pub connector_kind: ConnectorKind,
+    pub mount_id: String,
+    pub display_name: Option<String>,
+    pub dsn: String,
+    pub mount_point_mode: Option<String>,
+    pub mount_point: Option<String>,
+    pub project_path: Option<String>,
+    pub policy: Option<MountPolicyPatch>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MountPolicyPatch {
+    pub readonly: Option<bool>,
+    pub allowed_schemas: Option<Vec<String>>,
+    pub blocked_schemas: Option<Vec<String>>,
+    pub allowed_tables: Option<Vec<String>>,
+    pub blocked_tables: Option<Vec<String>>,
+    pub max_sample_rows: Option<usize>,
+    pub max_lookup_rows: Option<usize>,
+    pub max_file_bytes: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
+    pub redact_columns: Option<Vec<String>>,
+    pub require_tenant_filter: Option<bool>,
+    pub tenant_columns: Option<Vec<String>>,
+    pub allow_addressable_lookups: Option<bool>,
+    pub allow_custom_queries: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountResponse {
+    pub mount: MountRecord,
+    pub policy: MountPolicy,
+    pub credential: CredentialProfile,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountListResponse {
+    pub mounts: Vec<MountResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountActionResponse {
+    pub mount: MountRecord,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +316,30 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/summaries/activity", post(generate_activity_summary))
         .route("/api/projects", get(list_projects))
         .route("/api/projects/resolve", post(resolve_project))
+        .route(
+            "/api/projects/{projectId}/mounts/mysql/discover",
+            post(discover_mysql_mounts),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts",
+            get(list_project_mounts).post(create_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}",
+            get(get_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/start",
+            post(start_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/stop",
+            post(stop_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/policy",
+            patch(update_project_mount_policy),
+        )
         .route("/api/collaboration", get(get_collaboration_state))
         .route(
             "/api/collaboration/local-config",
@@ -503,6 +603,218 @@ async fn resolve_project(
     Json(ResolveProjectResponse {
         project: project::project_identity_for_path(Some(&request.path)),
     })
+}
+
+async fn discover_mysql_mounts(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<DiscoverMysqlMountRequest>,
+) -> Result<Json<DiscoverMysqlMountResponse>, AppError> {
+    let project_root =
+        project_root_for_request(&state, &project_id, request.project_path.clone()).await?;
+    Ok(Json(DiscoverMysqlMountResponse {
+        project_id,
+        candidates: mysql::discover_mysql_candidates(&project_root),
+    }))
+}
+
+async fn list_project_mounts(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountListResponse>, AppError> {
+    let store = load_mount_store_for_state(&state)?;
+    let mounts = store
+        .mounts
+        .iter()
+        .filter(|mount| mount.project_id == project_id)
+        .map(|mount| mount_response(&store, mount))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(MountListResponse { mounts }))
+}
+
+async fn get_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountResponse>, AppError> {
+    let store = load_mount_store_for_state(&state)?;
+    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+    Ok(Json(mount_response(&store, mount)?))
+}
+
+async fn create_project_mount(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<CreateMountRequest>,
+) -> Result<Json<MountResponse>, AppError> {
+    if request.connector_kind != ConnectorKind::Mysql {
+        return Err(AppError::BadRequest(
+            "only mysql mounts are supported in the Phase 1 MVP".to_string(),
+        ));
+    }
+    let mount_id = normalize_mount_id(&request.mount_id)?;
+    let project_root =
+        project_root_for_request(&state, &project_id, request.project_path.clone()).await?;
+    let mount_point = resolve_mount_point(&project_root, &mount_id, &request)?;
+    let now = Utc::now();
+    let policy_id = format!("{project_id}:{mount_id}:policy");
+    let credential_profile_id = format!("{project_id}:{mount_id}:credential");
+    let mut policy = MountPolicy::default_for(project_id.clone(), policy_id.clone());
+    if let Some(patch) = request.policy.clone() {
+        apply_policy_patch(&mut policy, patch)?;
+    }
+    policy.updated_at = now;
+
+    let display_name = request
+        .display_name
+        .clone()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| mount_id.clone());
+    let credential = CredentialProfile {
+        profile_id: credential_profile_id.clone(),
+        project_id: project_id.clone(),
+        kind: ConnectorKind::Mysql,
+        display_name: display_name.clone(),
+        redacted_dsn: mysql::redact_dsn(&request.dsn),
+        dsn_storage: "local-plaintext-todo-keychain".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    let secret = CredentialSecret {
+        profile_id: credential_profile_id.clone(),
+        project_id: project_id.clone(),
+        kind: ConnectorKind::Mysql,
+        local_dsn: request.dsn.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    let mount = MountRecord {
+        project_id: project_id.clone(),
+        mount_id: mount_id.clone(),
+        connector_kind: ConnectorKind::Mysql,
+        display_name,
+        mount_point: mount_point.to_string_lossy().to_string(),
+        credential_profile_id,
+        policy_id,
+        status: MountStatus::Stopped,
+        last_health_check_at: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let mut store = mount_storage::load_mount_store(&path)?;
+    mount_storage::upsert_mount(&mut store, mount.clone());
+    mount_storage::upsert_policy(&mut store, policy.clone());
+    mount_storage::upsert_credential_profile(&mut store, credential.clone());
+    mount_storage::upsert_credential_secret(&mut store, secret);
+    mount_storage::save_mount_store(&path, &store)?;
+
+    Ok(Json(MountResponse {
+        mount,
+        policy,
+        credential,
+    }))
+}
+
+async fn start_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountActionResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let mut store = mount_storage::load_mount_store(&path)?;
+    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+        .clone();
+    let policy = mount_storage::find_policy(&store, &mount.policy_id)
+        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+        .clone();
+    let secret = mount_storage::find_credential_secret(&store, &mount.credential_profile_id)
+        .ok_or_else(|| AppError::NotFound("mount credential secret was not found".to_string()))?
+        .clone();
+
+    let connector = LiveMysqlConnector::new(secret.local_dsn);
+    let start_result = async {
+        connector.health(&policy).await?;
+        fuse::start_readonly_mount(&mount)?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+
+    let now = Utc::now();
+    let message = match start_result {
+        Ok(()) => {
+            let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
+                .expect("mount exists");
+            mount.status = MountStatus::Running;
+            mount.last_health_check_at = Some(now);
+            mount.last_error = None;
+            mount.updated_at = now;
+            None
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
+                .expect("mount exists");
+            mount.status = MountStatus::Error;
+            mount.last_health_check_at = Some(now);
+            mount.last_error = Some(message.clone());
+            mount.updated_at = now;
+            Some(message)
+        }
+    };
+    mount_storage::save_mount_store(&path, &store)?;
+    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+        .expect("mount exists after start")
+        .clone();
+
+    Ok(Json(MountActionResponse { mount, message }))
+}
+
+async fn stop_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountActionResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let mut store = mount_storage::load_mount_store(&path)?;
+    let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
+        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+    let report = fuse::stop_readonly_mount(mount);
+    mount.status = MountStatus::Stopped;
+    mount.last_error = None;
+    mount.updated_at = Utc::now();
+    let mount = mount.clone();
+    mount_storage::save_mount_store(&path, &store)?;
+    state.mount_cache.clear_mount(&project_id, &mount_id);
+
+    Ok(Json(MountActionResponse {
+        mount,
+        message: Some(report.message),
+    }))
+}
+
+async fn update_project_mount_policy(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+    Json(request): Json<MountPolicyPatch>,
+) -> Result<Json<MountResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let mut store = mount_storage::load_mount_store(&path)?;
+    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+        .clone();
+    let policy = mount_storage::find_policy_mut(&mut store, &mount.policy_id)
+        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?;
+    apply_policy_patch(policy, request)?;
+    policy.updated_at = Utc::now();
+    let response = mount_response(&store, &mount)?;
+    mount_storage::save_mount_store(&path, &store)?;
+    state.mount_cache.clear_mount(&project_id, &mount_id);
+
+    Ok(Json(response))
 }
 
 async fn peer_session_delta_stream(
@@ -1438,6 +1750,157 @@ fn require_peer_token(headers: &HeaderMap, configured_token: Option<&str>) -> Re
     }
 }
 
+fn load_mount_store_for_state(state: &SharedState) -> Result<MountStore, AppError> {
+    mount_storage::load_mount_store(&mount_storage::mounts_path(&state.config.data_dir))
+}
+
+fn mount_response(store: &MountStore, mount: &MountRecord) -> Result<MountResponse, AppError> {
+    let policy = mount_storage::find_policy(store, &mount.policy_id)
+        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+        .clone();
+    let credential = mount_storage::find_credential_profile(store, &mount.credential_profile_id)
+        .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+        .clone();
+
+    Ok(MountResponse {
+        mount: mount.clone(),
+        policy,
+        credential,
+    })
+}
+
+async fn project_root_for_request(
+    state: &SharedState,
+    project_id: &str,
+    project_path: Option<String>,
+) -> Result<PathBuf, AppError> {
+    if let Some(path) = project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let identity = project::project_identity_for_path(Some(path));
+        if identity.project_id != project_id {
+            return Err(AppError::BadRequest(
+                "projectPath resolves to a different projectId".to_string(),
+            ));
+        }
+        return identity
+            .root_path
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::BadRequest("project root could not be resolved".to_string()));
+    }
+
+    let sessions = {
+        let inner = state.inner.read().await;
+        inner.sessions.values().cloned().collect::<Vec<_>>()
+    };
+    collaboration_projects(&sessions)
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .and_then(|project| project.root_path.map(PathBuf::from))
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "projectId is not known locally; include projectPath to resolve it".to_string(),
+            )
+        })
+}
+
+fn resolve_mount_point(
+    project_root: &FsPath,
+    mount_id: &str,
+    request: &CreateMountRequest,
+) -> Result<PathBuf, AppError> {
+    match request.mount_point.as_deref().map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => match request.mount_point_mode.as_deref().unwrap_or("project") {
+            "project" => Ok(fuse::project_mount_point(project_root, mount_id)),
+            other => Err(AppError::BadRequest(format!(
+                "unsupported mountPointMode '{other}'"
+            ))),
+        },
+    }
+}
+
+fn normalize_mount_id(mount_id: &str) -> Result<String, AppError> {
+    let mount_id = mount_id.trim();
+    if mount_id.is_empty()
+        || mount_id.contains('/')
+        || mount_id.contains('\\')
+        || mount_id == "."
+        || mount_id == ".."
+    {
+        return Err(AppError::BadRequest(
+            "mountId must be a non-empty path segment".to_string(),
+        ));
+    }
+    Ok(mount_id.to_string())
+}
+
+fn apply_policy_patch(policy: &mut MountPolicy, patch: MountPolicyPatch) -> Result<(), AppError> {
+    if let Some(readonly) = patch.readonly {
+        if !readonly {
+            return Err(AppError::BadRequest(
+                "Phase 1 mounts are always readonly".to_string(),
+            ));
+        }
+        policy.readonly = true;
+    }
+    if let Some(allowed_schemas) = patch.allowed_schemas {
+        policy.allowed_schemas = normalize_mount_list(allowed_schemas);
+    }
+    if let Some(blocked_schemas) = patch.blocked_schemas {
+        policy.blocked_schemas = normalize_mount_list(blocked_schemas);
+    }
+    if let Some(allowed_tables) = patch.allowed_tables {
+        policy.allowed_tables = normalize_mount_list(allowed_tables);
+    }
+    if let Some(blocked_tables) = patch.blocked_tables {
+        policy.blocked_tables = normalize_mount_list(blocked_tables);
+    }
+    if let Some(max_sample_rows) = patch.max_sample_rows {
+        policy.max_sample_rows = max_sample_rows.clamp(1, 1000);
+    }
+    if let Some(max_lookup_rows) = patch.max_lookup_rows {
+        policy.max_lookup_rows = max_lookup_rows.clamp(1, 1000);
+    }
+    if let Some(max_file_bytes) = patch.max_file_bytes {
+        policy.max_file_bytes = max_file_bytes.clamp(1024, 16 * 1024 * 1024);
+    }
+    if let Some(query_timeout_ms) = patch.query_timeout_ms {
+        policy.query_timeout_ms = query_timeout_ms.clamp(100, 30_000);
+    }
+    if let Some(redact_columns) = patch.redact_columns {
+        policy.redact_columns = normalize_mount_list(redact_columns);
+    }
+    if let Some(require_tenant_filter) = patch.require_tenant_filter {
+        policy.require_tenant_filter = require_tenant_filter;
+    }
+    if let Some(tenant_columns) = patch.tenant_columns {
+        policy.tenant_columns = normalize_mount_list(tenant_columns);
+    }
+    if let Some(allow_addressable_lookups) = patch.allow_addressable_lookups {
+        policy.allow_addressable_lookups = allow_addressable_lookups;
+    }
+    if let Some(allow_custom_queries) = patch.allow_custom_queries {
+        if allow_custom_queries {
+            return Err(AppError::BadRequest(
+                "arbitrary SQL is not supported in the Phase 1 MVP".to_string(),
+            ));
+        }
+        policy.allow_custom_queries = false;
+    }
+    Ok(())
+}
+
+fn normalize_mount_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn collaboration_projects(sessions: &[Session]) -> Vec<ProjectIdentity> {
     let mut projects = Vec::<ProjectIdentity>::new();
 
@@ -2124,6 +2587,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2188,6 +2652,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2247,6 +2712,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2305,6 +2771,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2466,6 +2933,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2504,6 +2972,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2748,6 +3217,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: crate::mounts::router::MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),

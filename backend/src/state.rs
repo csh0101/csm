@@ -12,6 +12,7 @@ use crate::{
     discovery::{self, LanDiscoveryHandle},
     error::AppError,
     models::{CollaborationStore, MetadataFile, PeerPresence, Session},
+    mounts::router::MountCache,
     scanner, storage,
 };
 
@@ -22,6 +23,7 @@ pub struct AppState {
     pub inner: RwLock<AppData>,
     pub lan_discovery: Mutex<Option<LanDiscoveryHandle>>,
     pub active_incremental_runs: Mutex<HashSet<String>>,
+    pub mount_cache: MountCache,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +90,7 @@ impl AppState {
             config,
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: MountCache::default(),
             inner: RwLock::new(AppData {
                 metadata,
                 collaboration,

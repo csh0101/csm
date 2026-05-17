@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 
 use async_trait::async_trait;
 use mysql_async::{Opts, Pool, Value as MysqlValue, params, prelude::*};
@@ -9,8 +9,8 @@ use crate::{
     error::AppError,
     mounts::{
         models::{
-            ColumnInfo, ForeignKeyInfo, ForeignKeyReference, IndexInfo, InferredRelation,
-            MountPolicy,
+            ColumnInfo, ConnectorKind, ForeignKeyInfo, ForeignKeyReference, IndexInfo,
+            InferredRelation, MountPolicy, MysqlDiscoveryCandidate,
         },
         policy,
     },
@@ -544,6 +544,67 @@ pub fn connection_summary(redacted_dsn: &str) -> Value {
     })
 }
 
+pub fn redact_dsn(dsn: &str) -> String {
+    let Ok(mut url) = url::Url::parse(dsn.trim()) else {
+        return "[redacted-dsn]".to_string();
+    };
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
+pub fn discover_mysql_candidates(project_root: &Path) -> Vec<MysqlDiscoveryCandidate> {
+    let mut candidates = Vec::new();
+    for file_name in [".env", ".env.local"] {
+        let path = project_root.join(file_name);
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let env = parse_env_lines(&content);
+        if let Some(dsn) = env
+            .get("DATABASE_URL")
+            .or_else(|| env.get("MYSQL_URL"))
+            .filter(|dsn| dsn.trim_start().starts_with("mysql://"))
+        {
+            candidates.push(MysqlDiscoveryCandidate {
+                source: file_name.to_string(),
+                kind: ConnectorKind::Mysql,
+                redacted_dsn: redact_dsn(dsn),
+                confidence: "high".to_string(),
+            });
+        } else if let (Some(host), Some(database), Some(user)) = (
+            env.get("MYSQL_HOST"),
+            env.get("MYSQL_DATABASE"),
+            env.get("MYSQL_USER"),
+        ) {
+            let port = env.get("MYSQL_PORT").map(String::as_str).unwrap_or("3306");
+            candidates.push(MysqlDiscoveryCandidate {
+                source: file_name.to_string(),
+                kind: ConnectorKind::Mysql,
+                redacted_dsn: format!("mysql://{user}@{host}:{port}/{database}"),
+                confidence: "medium".to_string(),
+            });
+        }
+    }
+    candidates
+}
+
+fn parse_env_lines(content: &str) -> BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            Some((
+                key.trim().to_string(),
+                value.trim().trim_matches('"').trim_matches('\'').to_string(),
+            ))
+        })
+        .collect()
+}
+
 pub fn rows_to_jsonl(rows: &[Value]) -> String {
     rows.iter()
         .map(Value::to_string)
@@ -594,4 +655,17 @@ pub fn manifest_from_indexes(indexes: &[IndexInfo], policy: &MountPolicy) -> Vec
         }
     }
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_dsn_removes_password() {
+        let redacted = redact_dsn("mysql://readonly:secret-password@127.0.0.1:3306/app");
+
+        assert_eq!(redacted, "mysql://readonly@127.0.0.1:3306/app");
+        assert!(!redacted.contains("secret-password"));
+    }
 }
