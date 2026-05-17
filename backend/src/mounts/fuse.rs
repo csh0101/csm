@@ -22,6 +22,7 @@ use crate::{
         models::MountRecord,
         mysql::LiveMysqlConnector,
         router::{self, MountCache, MountContext},
+        storage,
     },
 };
 
@@ -206,6 +207,29 @@ impl MysqlContextFuse {
         }
     }
 
+    fn current_context(&self) -> Result<MountContext, AppError> {
+        let store = storage::load_mount_store(&self.store_path)?;
+        let mount = storage::find_mount(
+            &store,
+            &self.context.mount.project_id,
+            &self.context.mount.mount_id,
+        )
+        .ok_or_else(|| AppError::NotFound("mount record was not found".to_string()))?
+        .clone();
+        let policy = storage::find_policy(&store, &mount.policy_id)
+            .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+            .clone();
+        let credential = storage::find_credential_profile(&store, &mount.credential_profile_id)
+            .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+            .clone();
+
+        Ok(MountContext {
+            mount,
+            policy,
+            credential,
+        })
+    }
+
     fn classify(&mut self, path: &str) -> Result<NodeKind, AppError> {
         if path == ROOT_PATH {
             return Ok(NodeKind::Directory);
@@ -216,11 +240,11 @@ impl MysqlContextFuse {
             });
         }
 
-        match self.runtime.block_on(router::readdir_virtual(
-            &self.context,
-            &self.connector,
-            path,
-        )) {
+        let context = self.current_context()?;
+        match self
+            .runtime
+            .block_on(router::readdir_virtual(&context, &self.connector, path))
+        {
             Ok(_) => Ok(NodeKind::Directory),
             Err(AppError::NotFound(_)) => self.file_size(path).map(|size| NodeKind::File { size }),
             Err(error) => Err(error),
@@ -228,9 +252,10 @@ impl MysqlContextFuse {
     }
 
     fn file_size(&self, path: &str) -> Result<u64, AppError> {
+        let context = self.current_context()?;
         self.runtime
             .block_on(router::read_virtual_file(
-                &self.context,
+                &context,
                 &self.connector,
                 &self.cache,
                 path,
@@ -239,8 +264,9 @@ impl MysqlContextFuse {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, AppError> {
+        let context = self.current_context()?;
         self.runtime.block_on(router::read_virtual_file_audited(
-            &self.context,
+            &context,
             &self.connector,
             &self.cache,
             &self.store_path,
@@ -390,17 +416,24 @@ impl Filesystem for MysqlContextFuse {
             reply.error(libc::ENOENT);
             return;
         };
-        let entries = match self.runtime.block_on(router::readdir_virtual(
-            &self.context,
-            &self.connector,
-            &path,
-        )) {
-            Ok(entries) => entries,
+        let context = match self.current_context() {
+            Ok(context) => context,
             Err(error) => {
                 reply.error(Self::errno_for(error));
                 return;
             }
         };
+        let entries =
+            match self
+                .runtime
+                .block_on(router::readdir_virtual(&context, &self.connector, &path))
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    reply.error(Self::errno_for(error));
+                    return;
+                }
+            };
 
         let mut all_entries = vec![
             (FUSE_ROOT_ID, FileType::Directory, ".".to_string()),
@@ -639,7 +672,18 @@ fn known_file_path(path: &str) -> bool {
 mod tests {
     use std::{
         fs,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use chrono::Utc;
+
+    use crate::mounts::{
+        models::{
+            ConnectorKind, CredentialProfile, CredentialSecret, MountPolicy, MountRecord,
+            MountStatus, MountStore,
+        },
+        router::MountCache,
     };
 
     use super::*;
@@ -673,6 +717,75 @@ mod tests {
         assert!(!known_file_path(
             "schemas/app/tables/users/lookup/by-primary/id"
         ));
+    }
+
+    #[test]
+    fn current_context_reflects_policy_updates_from_store() {
+        let root = unique_temp_dir("context-refresh");
+        fs::create_dir_all(&root).expect("create temp root");
+        let store_path = root.join("mounts.json");
+        let now = Utc::now();
+        let mount = MountRecord {
+            project_id: "project_a".to_string(),
+            mount_id: "mysql-main".to_string(),
+            connector_kind: ConnectorKind::Mysql,
+            display_name: "Main MySQL".to_string(),
+            mount_point: root
+                .join(".traceway/mounts/mysql-main")
+                .to_string_lossy()
+                .to_string(),
+            credential_profile_id: "cred_a".to_string(),
+            policy_id: "policy_a".to_string(),
+            status: MountStatus::Running,
+            last_health_check_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut persisted_policy = MountPolicy::default_for("project_a", "policy_a");
+        persisted_policy.allow_addressable_lookups = false;
+        let stale_policy = MountPolicy::default_for("project_a", "policy_a");
+        let credential = CredentialProfile {
+            profile_id: "cred_a".to_string(),
+            project_id: "project_a".to_string(),
+            kind: ConnectorKind::Mysql,
+            display_name: "Main MySQL".to_string(),
+            redacted_dsn: "mysql://readonly@127.0.0.1:3306/app".to_string(),
+            dsn_storage: "local-plaintext-todo-keychain".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let store = MountStore {
+            mounts: vec![mount.clone()],
+            policies: vec![persisted_policy],
+            credential_profiles: vec![credential.clone()],
+            credential_secrets: vec![CredentialSecret {
+                profile_id: "cred_a".to_string(),
+                project_id: "project_a".to_string(),
+                kind: ConnectorKind::Mysql,
+                local_dsn: "mysql://readonly@127.0.0.1:3306/app".to_string(),
+                created_at: now,
+                updated_at: now,
+            }],
+            audit_events: Vec::new(),
+        };
+        storage::save_mount_store(&store_path, &store).expect("save store");
+        let fuse = MysqlContextFuse::new(
+            MountContext {
+                mount,
+                policy: stale_policy,
+                credential,
+            },
+            "mysql://readonly@127.0.0.1:3306/app".to_string(),
+            store_path,
+            Arc::new(MountCache::default()),
+        )
+        .expect("create fuse");
+
+        let current = fuse.current_context().expect("current context");
+
+        assert!(!current.policy.allow_addressable_lookups);
+        fs::remove_dir_all(root).ok();
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

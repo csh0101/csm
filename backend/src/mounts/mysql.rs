@@ -573,6 +573,8 @@ pub fn redact_dsn(dsn: &str) -> String {
         return "[redacted-dsn]".to_string();
     };
     let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
     url.to_string()
 }
 
@@ -694,9 +696,12 @@ mod tests {
 
     #[test]
     fn redacted_dsn_removes_password() {
-        let redacted = redact_dsn("mysql://readonly:secret-password@127.0.0.1:3306/app");
+        let redacted =
+            redact_dsn("mysql://readonly:secret-password@127.0.0.1:3306/app?ssl-key=secret#token");
 
         assert_eq!(redacted, "mysql://readonly@127.0.0.1:3306/app");
         assert!(!redacted.contains("secret-password"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("token"));
     }
 }
