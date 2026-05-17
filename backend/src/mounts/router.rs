@@ -151,7 +151,15 @@ pub async fn readdir_virtual<C: MysqlConnector>(
             "queries".to_string(),
         ]),
         ["schemas"] => connector.schemas(&context.policy).await,
-        ["schemas", _schema] => Ok(vec!["schema.json".to_string(), "tables".to_string()]),
+        ["schemas", schema] => {
+            if crate::mounts::policy::schema_allowed(&context.policy, schema) {
+                Ok(vec!["schema.json".to_string(), "tables".to_string()])
+            } else {
+                Err(AppError::BadRequest(format!(
+                    "schema '{schema}' is blocked by policy"
+                )))
+            }
+        }
         ["schemas", schema, "tables"] => connector.tables(&context.policy, schema).await,
         ["schemas", schema, "tables", table] => {
             let indexes = connector.indexes(&context.policy, schema, table).await?;
@@ -521,6 +529,18 @@ mod tests {
         .expect("readdir");
 
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readdir_blocks_hidden_schema_direct_traversal() {
+        let context = test_context();
+        let connector = MockConnector;
+
+        let error = readdir_virtual(&context, &connector, "schemas/mysql")
+            .await
+            .expect_err("system schema should be blocked");
+
+        assert!(error.to_string().contains("blocked by policy"));
     }
 
     #[tokio::test]

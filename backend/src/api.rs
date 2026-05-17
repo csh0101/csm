@@ -29,6 +29,7 @@ use crate::{
             MountStatus, MountStore, MysqlDiscoveryCandidate,
         },
         mysql::{self, LiveMysqlConnector, MysqlConnector},
+        router::MountContext,
         storage as mount_storage,
     },
     project, scanner,
@@ -732,28 +733,44 @@ async fn start_project_mount(
     let policy = mount_storage::find_policy(&store, &mount.policy_id)
         .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
         .clone();
+    let credential = mount_storage::find_credential_profile(&store, &mount.credential_profile_id)
+        .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+        .clone();
     let secret = mount_storage::find_credential_secret(&store, &mount.credential_profile_id)
         .ok_or_else(|| AppError::NotFound("mount credential secret was not found".to_string()))?
         .clone();
 
-    let connector = LiveMysqlConnector::new(secret.local_dsn);
+    let connector = LiveMysqlConnector::new(secret.local_dsn.clone());
+    let context = MountContext {
+        mount: mount.clone(),
+        policy: policy.clone(),
+        credential,
+    };
     let start_result = async {
         connector.health(&policy).await?;
-        fuse::start_readonly_mount(&mount)?;
-        Ok::<(), AppError>(())
+        let report = fuse::start_readonly_mount(
+            context,
+            secret.local_dsn,
+            path.clone(),
+            state.mount_cache.clone(),
+        )?;
+        Ok::<_, AppError>(report)
     }
     .await;
 
     let now = Utc::now();
     let message = match start_result {
-        Ok(()) => {
+        Ok(report) => {
             let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
                 .expect("mount exists");
             mount.status = MountStatus::Running;
             mount.last_health_check_at = Some(now);
             mount.last_error = None;
             mount.updated_at = now;
-            None
+            Some(match report.gitignore_hint {
+                Some(hint) => format!("{} {}", report.message, hint),
+                None => report.message,
+            })
         }
         Err(error) => {
             let message = error.to_string();
@@ -2592,7 +2609,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2657,7 +2674,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2717,7 +2734,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2776,7 +2793,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2938,7 +2955,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2977,7 +2994,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -3222,7 +3239,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: crate::mounts::router::MountCache::default(),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),

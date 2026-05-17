@@ -23,7 +23,7 @@ pub struct AppState {
     pub inner: RwLock<AppData>,
     pub lan_discovery: Mutex<Option<LanDiscoveryHandle>>,
     pub active_incremental_runs: Mutex<HashSet<String>>,
-    pub mount_cache: MountCache,
+    pub mount_cache: Arc<MountCache>,
 }
 
 #[derive(Debug, Default)]
@@ -90,7 +90,7 @@ impl AppState {
             config,
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
-            mount_cache: MountCache::default(),
+            mount_cache: Arc::new(MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata,
                 collaboration,
