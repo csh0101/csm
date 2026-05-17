@@ -51,6 +51,16 @@ pub fn find_mount_mut<'a>(
     store.mounts.iter_mut().find(|mount| mount.key() == key)
 }
 
+pub fn find_mount_by_mount_point<'a>(
+    store: &'a MountStore,
+    mount_point: &str,
+) -> Option<&'a MountRecord> {
+    store
+        .mounts
+        .iter()
+        .find(|mount| mount.mount_point == mount_point)
+}
+
 pub fn find_policy<'a>(store: &'a MountStore, policy_id: &str) -> Option<&'a MountPolicy> {
     store
         .policies
@@ -188,5 +198,35 @@ mod tests {
                 .credential_profile_id,
             "cred_project_b"
         );
+    }
+
+    #[test]
+    fn mount_point_lookup_finds_existing_registered_path() {
+        let mut store = MountStore::default();
+        let now = Utc::now();
+        upsert_mount(
+            &mut store,
+            MountRecord {
+                project_id: "project_a".to_string(),
+                mount_id: "mysql-main".to_string(),
+                connector_kind: ConnectorKind::Mysql,
+                display_name: "Project A MySQL".to_string(),
+                mount_point: "/tmp/project/.traceway/mounts/mysql-main".to_string(),
+                credential_profile_id: "cred_project_a".to_string(),
+                policy_id: "policy_project_a".to_string(),
+                status: MountStatus::Stopped,
+                last_health_check_at: None,
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
+        let existing =
+            find_mount_by_mount_point(&store, "/tmp/project/.traceway/mounts/mysql-main")
+                .expect("existing mountpoint");
+
+        assert_eq!(existing.project_id, "project_a");
+        assert_eq!(existing.mount_id, "mysql-main");
     }
 }

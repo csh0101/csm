@@ -26,7 +26,7 @@ use crate::{
         fuse,
         models::{
             ConnectorKind, CredentialProfile, CredentialSecret, MountPolicy, MountRecord,
-            MountStatus, MountStore, MysqlDiscoveryCandidate,
+            MountStatus, MountStore, MysqlDiscoveryCandidate, mount_key,
         },
         mysql::{self, LiveMysqlConnector, MysqlConnector},
         router::MountContext,
@@ -708,6 +708,16 @@ async fn create_project_mount(
 
     let path = mount_storage::mounts_path(&state.config.data_dir);
     let mut store = mount_storage::load_mount_store(&path)?;
+    let requested_key = mount_key(&project_id, &mount_id);
+    let mount_point_str = mount_point.to_string_lossy().to_string();
+    if let Some(existing) = mount_storage::find_mount_by_mount_point(&store, &mount_point_str)
+        .filter(|existing| existing.key() != requested_key)
+    {
+        return Err(AppError::BadRequest(format!(
+            "mountPoint is already registered by project '{}' mount '{}'",
+            existing.project_id, existing.mount_id
+        )));
+    }
     mount_storage::upsert_mount(&mut store, mount.clone());
     mount_storage::upsert_policy(&mut store, policy.clone());
     mount_storage::upsert_credential_profile(&mut store, credential.clone());
