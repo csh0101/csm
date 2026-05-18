@@ -707,28 +707,30 @@ async fn create_project_mount(
     };
 
     let path = mount_storage::mounts_path(&state.config.data_dir);
-    let mut store = mount_storage::load_mount_store(&path)?;
     let requested_key = mount_key(&project_id, &mount_id);
     let mount_point_str = mount_point.to_string_lossy().to_string();
-    if let Some(existing) = mount_storage::find_mount_by_mount_point(&store, &mount_point_str)
-        .filter(|existing| existing.key() != requested_key)
-    {
-        return Err(AppError::BadRequest(format!(
-            "mountPoint is already registered by project '{}' mount '{}'",
-            existing.project_id, existing.mount_id
-        )));
-    }
-    mount_storage::upsert_mount(&mut store, mount.clone());
-    mount_storage::upsert_policy(&mut store, policy.clone());
-    mount_storage::upsert_credential_profile(&mut store, credential.clone());
-    mount_storage::upsert_credential_secret(&mut store, secret);
-    mount_storage::save_mount_store(&path, &store)?;
+    let response = mount_storage::with_mount_store(&path, |store| {
+        if let Some(existing) = mount_storage::find_mount_by_mount_point(store, &mount_point_str)
+            .filter(|existing| existing.key() != requested_key)
+        {
+            return Err(AppError::BadRequest(format!(
+                "mountPoint is already registered by project '{}' mount '{}'",
+                existing.project_id, existing.mount_id
+            )));
+        }
+        mount_storage::upsert_mount(store, mount.clone());
+        mount_storage::upsert_policy(store, policy.clone());
+        mount_storage::upsert_credential_profile(store, credential.clone());
+        mount_storage::upsert_credential_secret(store, secret);
 
-    Ok(Json(MountResponse {
-        mount,
-        policy,
-        credential,
-    }))
+        Ok(MountResponse {
+            mount,
+            policy,
+            credential,
+        })
+    })?;
+
+    Ok(Json(response))
 }
 
 async fn start_project_mount(
@@ -736,19 +738,23 @@ async fn start_project_mount(
     State(state): State<SharedState>,
 ) -> Result<Json<MountActionResponse>, AppError> {
     let path = mount_storage::mounts_path(&state.config.data_dir);
-    let mut store = mount_storage::load_mount_store(&path)?;
-    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
-        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
-        .clone();
-    let policy = mount_storage::find_policy(&store, &mount.policy_id)
-        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
-        .clone();
-    let credential = mount_storage::find_credential_profile(&store, &mount.credential_profile_id)
-        .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
-        .clone();
-    let secret = mount_storage::find_credential_secret(&store, &mount.credential_profile_id)
-        .ok_or_else(|| AppError::NotFound("mount credential secret was not found".to_string()))?
-        .clone();
+    let (mount, policy, credential, secret) = {
+        let store = mount_storage::load_mount_store(&path)?;
+        let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+            .clone();
+        let policy = mount_storage::find_policy(&store, &mount.policy_id)
+            .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+            .clone();
+        let credential =
+            mount_storage::find_credential_profile(&store, &mount.credential_profile_id)
+                .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+                .clone();
+        let secret = mount_storage::find_credential_secret(&store, &mount.credential_profile_id)
+            .ok_or_else(|| AppError::NotFound("mount credential secret was not found".to_string()))?
+            .clone();
+        (mount, policy, credential, secret)
+    };
 
     let connector = LiveMysqlConnector::new(secret.local_dsn.clone());
     let context = MountContext {
@@ -769,34 +775,28 @@ async fn start_project_mount(
     .await;
 
     let now = Utc::now();
-    let message = match start_result {
+    let (status, last_error, message) = match start_result {
         Ok(report) => {
-            let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
-                .expect("mount exists");
-            mount.status = MountStatus::Running;
-            mount.last_health_check_at = Some(now);
-            mount.last_error = None;
-            mount.updated_at = now;
-            Some(match report.gitignore_hint {
+            let message = match report.gitignore_hint {
                 Some(hint) => format!("{} {}", report.message, hint),
                 None => report.message,
-            })
+            };
+            (MountStatus::Running, None, Some(message))
         }
         Err(error) => {
             let message = error.to_string();
-            let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
-                .expect("mount exists");
-            mount.status = MountStatus::Error;
-            mount.last_health_check_at = Some(now);
-            mount.last_error = Some(message.clone());
-            mount.updated_at = now;
-            Some(message)
+            (MountStatus::Error, Some(message.clone()), Some(message))
         }
     };
-    mount_storage::save_mount_store(&path, &store)?;
-    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
-        .expect("mount exists after start")
-        .clone();
+    let mount = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount_mut(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+        mount.status = status;
+        mount.last_health_check_at = Some(now);
+        mount.last_error = last_error;
+        mount.updated_at = now;
+        Ok(mount.clone())
+    })?;
 
     Ok(Json(MountActionResponse { mount, message }))
 }
@@ -806,20 +806,20 @@ async fn stop_project_mount(
     State(state): State<SharedState>,
 ) -> Result<Json<MountActionResponse>, AppError> {
     let path = mount_storage::mounts_path(&state.config.data_dir);
-    let mut store = mount_storage::load_mount_store(&path)?;
-    let mount = mount_storage::find_mount_mut(&mut store, &project_id, &mount_id)
-        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
-    let report = fuse::stop_readonly_mount(mount);
-    mount.status = MountStatus::Stopped;
-    mount.last_error = None;
-    mount.updated_at = Utc::now();
-    let mount = mount.clone();
-    mount_storage::save_mount_store(&path, &store)?;
+    let (mount, message) = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount_mut(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+        let report = fuse::stop_readonly_mount(mount);
+        mount.status = MountStatus::Stopped;
+        mount.last_error = None;
+        mount.updated_at = Utc::now();
+        Ok((mount.clone(), report.message))
+    })?;
     state.mount_cache.clear_mount(&project_id, &mount_id);
 
     Ok(Json(MountActionResponse {
         mount,
-        message: Some(report.message),
+        message: Some(message),
     }))
 }
 
@@ -829,16 +829,16 @@ async fn update_project_mount_policy(
     Json(request): Json<MountPolicyPatch>,
 ) -> Result<Json<MountResponse>, AppError> {
     let path = mount_storage::mounts_path(&state.config.data_dir);
-    let mut store = mount_storage::load_mount_store(&path)?;
-    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
-        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
-        .clone();
-    let policy = mount_storage::find_policy_mut(&mut store, &mount.policy_id)
-        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?;
-    apply_policy_patch(policy, request)?;
-    policy.updated_at = Utc::now();
-    let response = mount_response(&store, &mount)?;
-    mount_storage::save_mount_store(&path, &store)?;
+    let response = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+            .clone();
+        let policy = mount_storage::find_policy_mut(store, &mount.policy_id)
+            .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?;
+        apply_policy_patch(policy, request)?;
+        policy.updated_at = Utc::now();
+        mount_response(store, &mount)
+    })?;
     state.mount_cache.clear_mount(&project_id, &mount_id);
 
     Ok(Json(response))

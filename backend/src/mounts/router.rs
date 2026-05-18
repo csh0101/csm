@@ -117,21 +117,22 @@ pub async fn read_virtual_file_audited<C: MysqlConnector>(
         Err(error) => ("error".to_string(), 0, Some(error.to_string())),
     };
 
-    let mut store = storage::load_mount_store(store_path)?;
-    storage::append_audit_event(
-        &mut store,
-        MountAuditRecord {
-            timestamp: chrono::Utc::now(),
-            project_id: context.mount.project_id.clone(),
-            mount_id: context.mount.mount_id.clone(),
-            virtual_path: normalize_virtual_path(virtual_path),
-            result: result_label,
-            bytes_returned,
-            duration_ms,
-            error,
-        },
-    );
-    storage::save_mount_store(store_path, &store)?;
+    storage::with_mount_store(store_path, |store| {
+        storage::append_audit_event(
+            store,
+            MountAuditRecord {
+                timestamp: chrono::Utc::now(),
+                project_id: context.mount.project_id.clone(),
+                mount_id: context.mount.mount_id.clone(),
+                virtual_path: normalize_virtual_path(virtual_path),
+                result: result_label,
+                bytes_returned,
+                duration_ms,
+                error,
+            },
+        );
+        Ok(())
+    })?;
 
     result
 }
