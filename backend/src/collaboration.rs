@@ -756,8 +756,22 @@ fn session_is_shareable(session: &Session, policy: &SharePolicy) -> bool {
         .shared_labels
         .iter()
         .any(|label| labels.contains(&label.to_ascii_lowercase()));
+    let uses_default_share_labels = default_share_labels(&policy.shared_labels);
 
-    !has_blocked && has_shared
+    !has_blocked && (uses_default_share_labels || has_shared)
+}
+
+fn default_share_labels(labels: &[String]) -> bool {
+    let labels = labels
+        .iter()
+        .map(|label| label.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let defaults = DEFAULT_SHARED_LABELS
+        .iter()
+        .map(|label| label.to_string())
+        .collect::<HashSet<_>>();
+
+    labels == defaults
 }
 
 fn public_labels(session: &Session, policy: &SharePolicy) -> Vec<String> {
@@ -1285,7 +1299,7 @@ mod tests {
             full_content: "content".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             project_path: Some("/work/project".to_string()),
-            labels: vec!["share".to_string()],
+            labels: vec!["project".to_string()],
             last_modified: Utc::now(),
             size: 1,
             status: crate::models::SessionStatus::Active,
@@ -1312,7 +1326,7 @@ mod tests {
             full_content: "content".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             project_path: Some("/work/project/packages/api".to_string()),
-            labels: vec!["share".to_string()],
+            labels: vec!["api".to_string()],
             last_modified: Utc::now(),
             size: 1,
             status: crate::models::SessionStatus::Active,
@@ -1343,7 +1357,7 @@ mod tests {
             full_content: "content".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             project_path: Some("/work/project".to_string()),
-            labels: vec!["share".to_string(), "private".to_string()],
+            labels: vec!["project".to_string(), "private".to_string()],
             last_modified: Utc::now(),
             size: 1,
             status: crate::models::SessionStatus::Active,
@@ -1353,9 +1367,38 @@ mod tests {
         let policy = default_share_policy(identity.project_id, session.project_path.clone());
         assert!(visible_project_sessions([&session].into_iter(), &[policy]).is_empty());
 
-        session.labels = vec!["review".to_string()];
+        session.labels = vec!["project".to_string()];
         let identity = project_identity_for_path(session.project_path.as_deref());
         let policy = default_share_policy(identity.project_id, session.project_path.clone());
+        assert_eq!(
+            visible_project_sessions([&session].into_iter(), &[policy]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn custom_shared_labels_keep_explicit_whitelist_behavior() {
+        let mut session = Session {
+            id: "id".to_string(),
+            codex_session_id: None,
+            name: "session".to_string(),
+            excerpt: "excerpt".to_string(),
+            full_content: "content".to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            project_path: Some("/work/project".to_string()),
+            labels: vec!["project".to_string()],
+            last_modified: Utc::now(),
+            size: 1,
+            status: crate::models::SessionStatus::Active,
+            notes: String::new(),
+        };
+        let identity = project_identity_for_path(session.project_path.as_deref());
+        let mut policy = default_share_policy(identity.project_id, session.project_path.clone());
+        policy.shared_labels = vec!["approved".to_string()];
+
+        assert!(visible_project_sessions([&session].into_iter(), &[policy.clone()]).is_empty());
+
+        session.labels = vec!["approved".to_string()];
         assert_eq!(
             visible_project_sessions([&session].into_iter(), &[policy]).len(),
             1

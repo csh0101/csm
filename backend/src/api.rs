@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::path::{Path as FsPath, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use axum::{
     Json, Router,
@@ -20,6 +24,16 @@ use crate::{
         CollaborationStore, CollaborationSummary, FilterCounts, LabelCount, MetadataFile,
         PeerMetadata, PeerPresence, ProjectIdentity, Session, SessionDeltaCursor, SessionMeta,
         SessionStatus, SharePolicy, Subscription, SubscriptionStatus,
+    },
+    mounts::{
+        fuse,
+        models::{
+            ConnectorKind, CredentialProfile, CredentialSecret, MountPolicy, MountRecord,
+            MountStatus, MountStore, MysqlDiscoveryCandidate, mount_key,
+        },
+        mysql::{self, LiveMysqlConnector, MysqlConnector},
+        router::MountContext,
+        storage as mount_storage,
     },
     project, scanner,
     state::SharedState,
@@ -89,6 +103,23 @@ pub struct UpdateNotesRequest {
     pub notes: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionContentRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContentResponse {
+    pub session_id: String,
+    pub path: String,
+    pub content: String,
+    pub format: String,
+    pub size: u64,
+    pub last_modified: chrono::DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMutationResponse {
@@ -118,6 +149,72 @@ pub struct ResolveProjectResponse {
     pub project: ProjectIdentity,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverMysqlMountRequest {
+    pub project_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverMysqlMountResponse {
+    pub project_id: String,
+    pub candidates: Vec<MysqlDiscoveryCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateMountRequest {
+    pub connector_kind: ConnectorKind,
+    pub mount_id: String,
+    pub display_name: Option<String>,
+    pub dsn: String,
+    pub mount_point_mode: Option<String>,
+    pub mount_point: Option<String>,
+    pub project_path: Option<String>,
+    pub policy: Option<MountPolicyPatch>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MountPolicyPatch {
+    pub readonly: Option<bool>,
+    pub allowed_schemas: Option<Vec<String>>,
+    pub blocked_schemas: Option<Vec<String>>,
+    pub allowed_tables: Option<Vec<String>>,
+    pub blocked_tables: Option<Vec<String>>,
+    pub max_sample_rows: Option<usize>,
+    pub max_lookup_rows: Option<usize>,
+    pub max_file_bytes: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
+    pub redact_columns: Option<Vec<String>>,
+    pub require_tenant_filter: Option<bool>,
+    pub tenant_columns: Option<Vec<String>>,
+    pub allow_addressable_lookups: Option<bool>,
+    pub allow_custom_queries: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountResponse {
+    pub mount: MountRecord,
+    pub policy: MountPolicy,
+    pub credential: CredentialProfile,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountListResponse {
+    pub mounts: Vec<MountResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountActionResponse {
+    pub mount: MountRecord,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalCollaborationConfig {
@@ -125,6 +222,7 @@ pub struct LocalCollaborationConfig {
     pub display_name: String,
     pub base_url: String,
     pub bind_address: String,
+    pub lan_base_urls: Vec<String>,
     pub peer_token: Option<String>,
     pub peer_token_configured: bool,
     pub lan_discovery_enabled: bool,
@@ -174,6 +272,13 @@ pub struct PeerProjectsRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePeerAccessTokenRequest {
+    pub peer_access_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTrustedPeerRequest {
+    pub peer_base_url: Option<String>,
     pub peer_access_token: Option<String>,
 }
 
@@ -235,11 +340,39 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/scan", post(scan_sessions))
         .route("/api/settings", patch(update_settings))
+        .route(
+            "/api/sessions/{id}/content",
+            get(get_session_content).patch(update_session_content),
+        )
         .route("/api/sessions/{id}/labels", patch(update_labels))
         .route("/api/sessions/{id}/notes", patch(update_notes))
         .route("/api/summaries/activity", post(generate_activity_summary))
         .route("/api/projects", get(list_projects))
         .route("/api/projects/resolve", post(resolve_project))
+        .route(
+            "/api/projects/{projectId}/mounts/mysql/discover",
+            post(discover_mysql_mounts),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts",
+            get(list_project_mounts).post(create_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}",
+            get(get_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/start",
+            post(start_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/stop",
+            post(stop_project_mount),
+        )
+        .route(
+            "/api/projects/{projectId}/mounts/{mountId}/policy",
+            patch(update_project_mount_policy),
+        )
         .route("/api/collaboration", get(get_collaboration_state))
         .route(
             "/api/collaboration/local-config",
@@ -257,6 +390,10 @@ pub fn router(state: SharedState) -> Router {
         .route(
             "/api/collaboration/peers/{peerId}/token",
             patch(update_trusted_peer_token),
+        )
+        .route(
+            "/api/collaboration/peers/{peerId}",
+            patch(update_trusted_peer).delete(delete_trusted_peer),
         )
         .route(
             "/api/collaboration/peers/{peerId}/projects",
@@ -505,6 +642,244 @@ async fn resolve_project(
     })
 }
 
+async fn discover_mysql_mounts(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<DiscoverMysqlMountRequest>,
+) -> Result<Json<DiscoverMysqlMountResponse>, AppError> {
+    let project_root =
+        project_root_for_request(&state, &project_id, request.project_path.clone()).await?;
+    Ok(Json(DiscoverMysqlMountResponse {
+        project_id,
+        candidates: mysql::discover_mysql_candidates(&project_root),
+    }))
+}
+
+async fn list_project_mounts(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountListResponse>, AppError> {
+    let store = load_mount_store_for_state(&state)?;
+    let mounts = store
+        .mounts
+        .iter()
+        .filter(|mount| mount.project_id == project_id)
+        .map(|mount| mount_response(&store, mount))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(MountListResponse { mounts }))
+}
+
+async fn get_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountResponse>, AppError> {
+    let store = load_mount_store_for_state(&state)?;
+    let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+        .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+    Ok(Json(mount_response(&store, mount)?))
+}
+
+async fn create_project_mount(
+    Path(project_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<CreateMountRequest>,
+) -> Result<Json<MountResponse>, AppError> {
+    if request.connector_kind != ConnectorKind::Mysql {
+        return Err(AppError::BadRequest(
+            "only mysql mounts are supported in the Phase 1 MVP".to_string(),
+        ));
+    }
+    let mount_id = normalize_mount_id(&request.mount_id)?;
+    let project_root =
+        project_root_for_request(&state, &project_id, request.project_path.clone()).await?;
+    let mount_point = resolve_mount_point(&project_root, &mount_id, &request)?;
+    let now = Utc::now();
+    let policy_id = format!("{project_id}:{mount_id}:policy");
+    let credential_profile_id = format!("{project_id}:{mount_id}:credential");
+    let mut policy = MountPolicy::default_for(project_id.clone(), policy_id.clone());
+    if let Some(patch) = request.policy.clone() {
+        apply_policy_patch(&mut policy, patch)?;
+    }
+    policy.updated_at = now;
+
+    let display_name = request
+        .display_name
+        .clone()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| mount_id.clone());
+    let credential = CredentialProfile {
+        profile_id: credential_profile_id.clone(),
+        project_id: project_id.clone(),
+        kind: ConnectorKind::Mysql,
+        display_name: display_name.clone(),
+        redacted_dsn: mysql::redact_dsn(&request.dsn),
+        dsn_storage: "local-plaintext-todo-keychain".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    let secret = CredentialSecret {
+        profile_id: credential_profile_id.clone(),
+        project_id: project_id.clone(),
+        kind: ConnectorKind::Mysql,
+        local_dsn: request.dsn.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    let mount = MountRecord {
+        project_id: project_id.clone(),
+        mount_id: mount_id.clone(),
+        connector_kind: ConnectorKind::Mysql,
+        display_name,
+        mount_point: mount_point.to_string_lossy().to_string(),
+        credential_profile_id,
+        policy_id,
+        status: MountStatus::Stopped,
+        last_health_check_at: None,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let requested_key = mount_key(&project_id, &mount_id);
+    let mount_point_str = mount_point.to_string_lossy().to_string();
+    let response = mount_storage::with_mount_store(&path, |store| {
+        if let Some(existing) = mount_storage::find_mount_by_mount_point(store, &mount_point_str)
+            .filter(|existing| existing.key() != requested_key)
+        {
+            return Err(AppError::BadRequest(format!(
+                "mountPoint is already registered by project '{}' mount '{}'",
+                existing.project_id, existing.mount_id
+            )));
+        }
+        mount_storage::upsert_mount(store, mount.clone());
+        mount_storage::upsert_policy(store, policy.clone());
+        mount_storage::upsert_credential_profile(store, credential.clone());
+        mount_storage::upsert_credential_secret(store, secret);
+
+        Ok(MountResponse {
+            mount,
+            policy,
+            credential,
+        })
+    })?;
+
+    Ok(Json(response))
+}
+
+async fn start_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountActionResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let (mount, policy, credential, secret) = {
+        let store = mount_storage::load_mount_store(&path)?;
+        let mount = mount_storage::find_mount(&store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+            .clone();
+        let policy = mount_storage::find_policy(&store, &mount.policy_id)
+            .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+            .clone();
+        let credential =
+            mount_storage::find_credential_profile(&store, &mount.credential_profile_id)
+                .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+                .clone();
+        let secret = mount_storage::find_credential_secret(&store, &mount.credential_profile_id)
+            .ok_or_else(|| AppError::NotFound("mount credential secret was not found".to_string()))?
+            .clone();
+        (mount, policy, credential, secret)
+    };
+
+    let connector = LiveMysqlConnector::new(secret.local_dsn.clone());
+    let context = MountContext {
+        mount: mount.clone(),
+        policy: policy.clone(),
+        credential,
+    };
+    let start_result = async {
+        connector.health(&policy).await?;
+        let report = fuse::start_readonly_mount(
+            context,
+            secret.local_dsn,
+            path.clone(),
+            state.mount_cache.clone(),
+        )?;
+        Ok::<_, AppError>(report)
+    }
+    .await;
+
+    let now = Utc::now();
+    let (status, last_error, message) = match start_result {
+        Ok(report) => {
+            let message = match report.gitignore_hint {
+                Some(hint) => format!("{} {}", report.message, hint),
+                None => report.message,
+            };
+            (MountStatus::Running, None, Some(message))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            (MountStatus::Error, Some(message.clone()), Some(message))
+        }
+    };
+    let mount = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount_mut(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+        mount.status = status;
+        mount.last_health_check_at = Some(now);
+        mount.last_error = last_error;
+        mount.updated_at = now;
+        Ok(mount.clone())
+    })?;
+
+    Ok(Json(MountActionResponse { mount, message }))
+}
+
+async fn stop_project_mount(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<Json<MountActionResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let (mount, message) = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount_mut(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?;
+        let report = fuse::stop_readonly_mount(mount);
+        mount.status = MountStatus::Stopped;
+        mount.last_error = None;
+        mount.updated_at = Utc::now();
+        Ok((mount.clone(), report.message))
+    })?;
+    state.mount_cache.clear_mount(&project_id, &mount_id);
+
+    Ok(Json(MountActionResponse {
+        mount,
+        message: Some(message),
+    }))
+}
+
+async fn update_project_mount_policy(
+    Path((project_id, mount_id)): Path<(String, String)>,
+    State(state): State<SharedState>,
+    Json(request): Json<MountPolicyPatch>,
+) -> Result<Json<MountResponse>, AppError> {
+    let path = mount_storage::mounts_path(&state.config.data_dir);
+    let response = mount_storage::with_mount_store(&path, |store| {
+        let mount = mount_storage::find_mount(store, &project_id, &mount_id)
+            .ok_or_else(|| AppError::NotFound(format!("mount '{mount_id}' was not found")))?
+            .clone();
+        let policy = mount_storage::find_policy_mut(store, &mount.policy_id)
+            .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?;
+        apply_policy_patch(policy, request)?;
+        policy.updated_at = Utc::now();
+        mount_response(store, &mount)
+    })?;
+    state.mount_cache.clear_mount(&project_id, &mount_id);
+
+    Ok(Json(response))
+}
+
 async fn peer_session_delta_stream(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -663,6 +1038,73 @@ async fn update_settings(
     }))
 }
 
+async fn get_session_content(
+    Path(id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<SessionContentResponse>, AppError> {
+    let session = {
+        let inner = state.inner.read().await;
+        inner
+            .sessions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("session '{id}' was not found")))?
+    };
+    let path = PathBuf::from(&session.path);
+    let content = tokio::fs::read_to_string(&path).await?;
+
+    Ok(Json(SessionContentResponse {
+        session_id: session.id.clone(),
+        path: session.path.clone(),
+        format: session_content_format(&path),
+        size: content.len() as u64,
+        last_modified: session.last_modified,
+        content,
+    }))
+}
+
+async fn update_session_content(
+    Path(id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<UpdateSessionContentRequest>,
+) -> Result<Json<SessionMutationResponse>, AppError> {
+    let (session, metadata, stale_after_days) = {
+        let inner = state.inner.read().await;
+        let session = inner
+            .sessions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("session '{id}' was not found")))?;
+        (session, inner.metadata.clone(), inner.stale_after_days)
+    };
+    let path = PathBuf::from(&session.path);
+
+    validate_session_content(&path, &request.content)?;
+    tokio::fs::write(&path, request.content).await?;
+
+    let session = scanner::scan_session_file(
+        &path,
+        &metadata,
+        state.config.max_preview_bytes,
+        stale_after_days,
+    )?;
+    if session.id != id {
+        return Err(AppError::BadRequest(
+            "edited file no longer resolves to the same session".to_string(),
+        ));
+    }
+
+    {
+        let mut inner = state.inner.write().await;
+        inner.sessions.insert(session.id.clone(), session.clone());
+    }
+
+    Ok(Json(SessionMutationResponse {
+        session,
+        archive_record: None,
+    }))
+}
+
 async fn update_labels(
     Path(id): Path<String>,
     State(state): State<SharedState>,
@@ -814,7 +1256,9 @@ async fn generate_activity_summary(
 
 async fn get_collaboration_state(
     State(state): State<SharedState>,
-) -> Json<CollaborationStateResponse> {
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    sync_trusted_peers_from_presence(&state).await?;
+
     let (store, sessions, discovered_peers) = {
         let inner = state.inner.read().await;
         (
@@ -824,12 +1268,12 @@ async fn get_collaboration_state(
         )
     };
 
-    Json(CollaborationStateResponse {
+    Ok(Json(CollaborationStateResponse {
         local_config: local_collaboration_config(&store, &state.config),
         store,
         projects: collaboration_projects(&sessions),
         discovered_peers,
-    })
+    }))
 }
 
 async fn update_share_policy(
@@ -927,6 +1371,92 @@ async fn update_trusted_peer_token(
     let access_token = normalize_optional_text(request.peer_access_token.unwrap_or_default())
         .ok_or_else(|| AppError::BadRequest("peerAccessToken must not be empty".to_string()))?;
 
+    update_trusted_peer_connection(
+        &peer_id,
+        &state,
+        UpdateTrustedPeerRequest {
+            peer_base_url: None,
+            peer_access_token: Some(access_token),
+        },
+    )
+    .await
+}
+
+async fn update_trusted_peer(
+    Path(peer_id): Path<String>,
+    State(state): State<SharedState>,
+    Json(request): Json<UpdateTrustedPeerRequest>,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    update_trusted_peer_connection(&peer_id, &state, request).await
+}
+
+async fn delete_trusted_peer(
+    Path(peer_id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    let mut inner = state.inner.write().await;
+    let mut collaboration = inner.collaboration.clone();
+    let before = collaboration.trusted_peers.len();
+    collaboration
+        .trusted_peers
+        .retain(|peer| peer.peer_id != peer_id);
+    if collaboration.trusted_peers.len() == before {
+        return Err(AppError::NotFound(format!(
+            "paired peer '{peer_id}' was not found"
+        )));
+    }
+
+    collaboration.sources.retain(|source| {
+        source.source_id != peer_id && source.peer_id.as_deref() != Some(peer_id.as_str())
+    });
+    collaboration
+        .subscriptions
+        .retain(|subscription| subscription.peer_id != peer_id);
+    collaboration
+        .delta_cursors
+        .retain(|cursor| cursor.source_id != peer_id);
+    collaboration.summaries.retain(|summary| {
+        !summary
+            .source_ids
+            .iter()
+            .any(|source_id| source_id == &peer_id)
+    });
+    collaboration.hints.retain(|hint| {
+        !hint.evidence.iter().any(|evidence| {
+            evidence.source_id == peer_id || evidence.peer_id.as_deref() == Some(peer_id.as_str())
+        })
+    });
+
+    storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+    inner.collaboration = collaboration.clone();
+    inner.peer_presence.remove(&peer_id);
+
+    Ok(Json(collaboration_state_response(
+        &collaboration,
+        &inner.sessions,
+        &inner.peer_presence,
+        &state.config,
+    )))
+}
+
+async fn update_trusted_peer_connection(
+    peer_id: &str,
+    state: &SharedState,
+    request: UpdateTrustedPeerRequest,
+) -> Result<Json<CollaborationStateResponse>, AppError> {
+    let peer_base_url = match request.peer_base_url {
+        Some(value) => Some(collaboration::normalize_peer_base_url(&value)?),
+        None => None,
+    };
+    let access_token = request
+        .peer_access_token
+        .and_then(|value| normalize_optional_text(value));
+    if peer_base_url.is_none() && access_token.is_none() {
+        return Err(AppError::BadRequest(
+            "peerBaseUrl or peerAccessToken must be provided".to_string(),
+        ));
+    }
+
     let mut inner = state.inner.write().await;
     let mut collaboration = inner.collaboration.clone();
     let peer = collaboration
@@ -934,8 +1464,12 @@ async fn update_trusted_peer_token(
         .iter_mut()
         .find(|peer| peer.peer_id == peer_id)
         .ok_or_else(|| AppError::NotFound(format!("paired peer '{peer_id}' was not found")))?;
-    peer.access_token = Some(access_token);
-    peer.last_seen_at = Some(Utc::now());
+    if let Some(peer_base_url) = peer_base_url {
+        peer.base_url = Some(peer_base_url);
+    }
+    if let Some(access_token) = access_token {
+        peer.access_token = Some(access_token);
+    }
 
     storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
     inner.collaboration = collaboration.clone();
@@ -953,16 +1487,7 @@ async fn trusted_peer_projects(
     State(state): State<SharedState>,
     Json(request): Json<PeerProjectsRequest>,
 ) -> Result<Json<Vec<collaboration::PeerProject>>, AppError> {
-    let peer = {
-        let inner = state.inner.read().await;
-        inner
-            .collaboration
-            .trusted_peers
-            .iter()
-            .find(|peer| peer.peer_id == peer_id)
-            .cloned()
-            .ok_or_else(|| AppError::NotFound(format!("paired peer '{peer_id}' was not found")))?
-    };
+    let peer = trusted_peer_for_network(&state, &peer_id).await?;
     let peer_base_url = peer
         .base_url
         .as_deref()
@@ -990,8 +1515,12 @@ async fn create_subscription(
     let (sessions, peer) = {
         let inner = state.inner.read().await;
         let peer = resolve_subscription_peer(&inner.collaboration, &request)?;
-        (inner.sessions.values().cloned().collect::<Vec<_>>(), peer)
+        (
+            inner.sessions.values().cloned().collect::<Vec<_>>(),
+            peer.peer_id,
+        )
     };
+    let peer = trusted_peer_for_network(&state, &peer).await?;
     let peer_base_url = peer
         .base_url
         .clone()
@@ -1108,9 +1637,17 @@ async fn generate_collaboration_baseline(
     State(state): State<SharedState>,
     Json(mut request): Json<collaboration::BaselineSummaryRequest>,
 ) -> Result<Json<crate::models::CollaborationSummary>, AppError> {
-    let sessions = {
+    let (sessions, peer_id) = {
         let inner = state.inner.read().await;
-        let peer = resolve_paired_baseline_peer(&inner.collaboration, &request)?;
+        let peer =
+            resolve_paired_baseline_peer(&inner.collaboration, &inner.peer_presence, &request)?;
+        (
+            inner.sessions.values().cloned().collect::<Vec<_>>(),
+            peer.peer_id,
+        )
+    };
+    let peer = trusted_peer_for_network(&state, &peer_id).await?;
+    {
         request.peer_id = Some(peer.peer_id.clone());
         request.peer_display_name = Some(peer.display_name.clone());
         request.peer_trusted = Some(peer.trusted);
@@ -1123,7 +1660,6 @@ async fn generate_collaboration_baseline(
             normalize_optional_text(request.peer_access_token.unwrap_or_default()),
             &peer,
         );
-        inner.sessions.values().cloned().collect::<Vec<_>>()
     };
     let summary = collaboration::generate_baseline_summary(sessions, request).await?;
 
@@ -1172,7 +1708,7 @@ async fn run_incremental_summary_inner(
     state: SharedState,
     request: IncrementalSummaryRequest,
 ) -> Result<IncrementalSummaryResponse, AppError> {
-    let (sessions, peer, subscription, cursor, active_since, previous_summaries) = {
+    let (sessions, peer_id, subscription, cursor, active_since, previous_summaries) = {
         let inner = state.inner.read().await;
         let subscription = inner
             .collaboration
@@ -1220,13 +1756,14 @@ async fn run_incremental_summary_inner(
 
         (
             inner.sessions.values().cloned().collect::<Vec<_>>(),
-            peer,
+            peer.peer_id,
             subscription,
             cursor.cloned(),
             active_since,
             previous_summaries,
         )
     };
+    let peer = trusted_peer_for_network(&state, &peer_id).await?;
     let peer_base_url = peer
         .base_url
         .clone()
@@ -1438,6 +1975,162 @@ fn require_peer_token(headers: &HeaderMap, configured_token: Option<&str>) -> Re
     }
 }
 
+fn load_mount_store_for_state(state: &SharedState) -> Result<MountStore, AppError> {
+    mount_storage::load_mount_store(&mount_storage::mounts_path(&state.config.data_dir))
+}
+
+fn mount_response(store: &MountStore, mount: &MountRecord) -> Result<MountResponse, AppError> {
+    let policy = mount_storage::find_policy(store, &mount.policy_id)
+        .ok_or_else(|| AppError::NotFound("mount policy was not found".to_string()))?
+        .clone();
+    let credential = mount_storage::find_credential_profile(store, &mount.credential_profile_id)
+        .ok_or_else(|| AppError::NotFound("mount credential was not found".to_string()))?
+        .clone();
+
+    Ok(MountResponse {
+        mount: mount.clone(),
+        policy,
+        credential,
+    })
+}
+
+async fn project_root_for_request(
+    state: &SharedState,
+    project_id: &str,
+    project_path: Option<String>,
+) -> Result<PathBuf, AppError> {
+    if let Some(path) = project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let identity = project::project_identity_for_path(Some(path));
+        if identity.project_id != project_id {
+            return Err(AppError::BadRequest(
+                "projectPath resolves to a different projectId".to_string(),
+            ));
+        }
+        return identity
+            .root_path
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::BadRequest("project root could not be resolved".to_string()));
+    }
+
+    let sessions = {
+        let inner = state.inner.read().await;
+        inner.sessions.values().cloned().collect::<Vec<_>>()
+    };
+    collaboration_projects(&sessions)
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .and_then(|project| project.root_path.map(PathBuf::from))
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "projectId is not known locally; include projectPath to resolve it".to_string(),
+            )
+        })
+}
+
+fn resolve_mount_point(
+    project_root: &FsPath,
+    mount_id: &str,
+    request: &CreateMountRequest,
+) -> Result<PathBuf, AppError> {
+    match request
+        .mount_point
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => match request.mount_point_mode.as_deref().unwrap_or("project") {
+            "project" => Ok(fuse::project_mount_point(project_root, mount_id)),
+            other => Err(AppError::BadRequest(format!(
+                "unsupported mountPointMode '{other}'"
+            ))),
+        },
+    }
+}
+
+fn normalize_mount_id(mount_id: &str) -> Result<String, AppError> {
+    let mount_id = mount_id.trim();
+    if mount_id.is_empty()
+        || mount_id.contains('/')
+        || mount_id.contains('\\')
+        || mount_id == "."
+        || mount_id == ".."
+    {
+        return Err(AppError::BadRequest(
+            "mountId must be a non-empty path segment".to_string(),
+        ));
+    }
+    Ok(mount_id.to_string())
+}
+
+fn apply_policy_patch(policy: &mut MountPolicy, patch: MountPolicyPatch) -> Result<(), AppError> {
+    if let Some(readonly) = patch.readonly {
+        if !readonly {
+            return Err(AppError::BadRequest(
+                "Phase 1 mounts are always readonly".to_string(),
+            ));
+        }
+        policy.readonly = true;
+    }
+    if let Some(allowed_schemas) = patch.allowed_schemas {
+        policy.allowed_schemas = normalize_mount_list(allowed_schemas);
+    }
+    if let Some(blocked_schemas) = patch.blocked_schemas {
+        policy.blocked_schemas = normalize_mount_list(blocked_schemas);
+    }
+    if let Some(allowed_tables) = patch.allowed_tables {
+        policy.allowed_tables = normalize_mount_list(allowed_tables);
+    }
+    if let Some(blocked_tables) = patch.blocked_tables {
+        policy.blocked_tables = normalize_mount_list(blocked_tables);
+    }
+    if let Some(max_sample_rows) = patch.max_sample_rows {
+        policy.max_sample_rows = max_sample_rows.clamp(1, 1000);
+    }
+    if let Some(max_lookup_rows) = patch.max_lookup_rows {
+        policy.max_lookup_rows = max_lookup_rows.clamp(1, 1000);
+    }
+    if let Some(max_file_bytes) = patch.max_file_bytes {
+        policy.max_file_bytes = max_file_bytes.clamp(1024, 16 * 1024 * 1024);
+    }
+    if let Some(query_timeout_ms) = patch.query_timeout_ms {
+        policy.query_timeout_ms = query_timeout_ms.clamp(100, 30_000);
+    }
+    if let Some(redact_columns) = patch.redact_columns {
+        policy.redact_columns = normalize_mount_list(redact_columns);
+    }
+    if let Some(require_tenant_filter) = patch.require_tenant_filter {
+        policy.require_tenant_filter = require_tenant_filter;
+    }
+    if let Some(tenant_columns) = patch.tenant_columns {
+        policy.tenant_columns = normalize_mount_list(tenant_columns);
+    }
+    if let Some(allow_addressable_lookups) = patch.allow_addressable_lookups {
+        policy.allow_addressable_lookups = allow_addressable_lookups;
+    }
+    if let Some(allow_custom_queries) = patch.allow_custom_queries {
+        if allow_custom_queries {
+            return Err(AppError::BadRequest(
+                "arbitrary SQL is not supported in the Phase 1 MVP".to_string(),
+            ));
+        }
+        policy.allow_custom_queries = false;
+    }
+    Ok(())
+}
+
+fn normalize_mount_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn collaboration_projects(sessions: &[Session]) -> Vec<ProjectIdentity> {
     let mut projects = Vec::<ProjectIdentity>::new();
 
@@ -1484,6 +2177,38 @@ fn merge_share_policy(policy: &mut SharePolicy, request: UpdateSharePolicyReques
 fn normalize_optional_text(value: String) -> Option<String> {
     let value = value.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn session_content_format(path: &FsPath) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .filter(|extension| extension == "json" || extension == "jsonl")
+        .unwrap_or_else(|| "text".to_string())
+}
+
+fn validate_session_content(path: &FsPath, content: &str) -> Result<(), AppError> {
+    match session_content_format(path).as_str() {
+        "json" => serde_json::from_str::<serde_json::Value>(content)
+            .map(|_| ())
+            .map_err(|error| AppError::BadRequest(format!("invalid JSON: {error}"))),
+        "jsonl" => validate_jsonl_content(content),
+        _ => Ok(()),
+    }
+}
+
+fn validate_jsonl_content(content: &str) -> Result<(), AppError> {
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+            AppError::BadRequest(format!("invalid JSONL at line {}: {error}", index + 1))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn normalize_labels(labels: Vec<String>) -> Vec<String> {
@@ -1652,6 +2377,92 @@ async fn send_peer_json<T: serde::de::DeserializeOwned>(
         .map_err(|error| AppError::External(format!("peer returned invalid JSON: {error}")))
 }
 
+async fn sync_trusted_peers_from_presence(state: &SharedState) -> Result<(), AppError> {
+    let mut inner = state.inner.write().await;
+    let peer_presence = inner.peer_presence.clone();
+    let mut collaboration = inner.collaboration.clone();
+    if !refresh_trusted_peer_urls_from_presence(&mut collaboration, &peer_presence) {
+        return Ok(());
+    }
+
+    storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+    inner.collaboration = collaboration;
+
+    Ok(())
+}
+
+async fn trusted_peer_for_network(
+    state: &SharedState,
+    peer_id: &str,
+) -> Result<PeerMetadata, AppError> {
+    let mut inner = state.inner.write().await;
+    let peer_presence = inner.peer_presence.clone();
+    let mut collaboration = inner.collaboration.clone();
+    let (peer, changed) = refreshed_trusted_peer(&mut collaboration, &peer_presence, peer_id)?;
+    let peer = peer.clone();
+    if changed {
+        storage::save_collaboration_store(&state.config.collaboration_path, &collaboration)?;
+        inner.collaboration = collaboration;
+    }
+
+    Ok(peer)
+}
+
+fn refreshed_trusted_peer<'a>(
+    store: &'a mut CollaborationStore,
+    peer_presence: &HashMap<String, PeerPresence>,
+    peer_id: &str,
+) -> Result<(&'a PeerMetadata, bool), AppError> {
+    let peer = store
+        .trusted_peers
+        .iter_mut()
+        .find(|peer| peer.peer_id == peer_id)
+        .ok_or_else(|| AppError::NotFound(format!("paired peer '{peer_id}' was not found")))?;
+
+    let changed = fresh_peer_presence(peer_presence, peer_id)
+        .is_some_and(|presence| apply_presence_to_trusted_peer(peer, presence));
+
+    Ok((peer, changed))
+}
+
+fn refresh_trusted_peer_urls_from_presence(
+    store: &mut CollaborationStore,
+    peer_presence: &HashMap<String, PeerPresence>,
+) -> bool {
+    let mut changed = false;
+    for peer in &mut store.trusted_peers {
+        if let Some(presence) = fresh_peer_presence(peer_presence, &peer.peer_id) {
+            changed |= apply_presence_to_trusted_peer(peer, presence);
+        }
+    }
+
+    changed
+}
+
+fn fresh_peer_presence<'a>(
+    peer_presence: &'a HashMap<String, PeerPresence>,
+    peer_id: &str,
+) -> Option<&'a PeerPresence> {
+    let stale_cutoff = Utc::now() - Duration::seconds(DISCOVERED_PEER_TTL_SECONDS);
+    peer_presence
+        .get(peer_id)
+        .filter(|presence| presence.last_seen_at >= stale_cutoff)
+}
+
+fn apply_presence_to_trusted_peer(peer: &mut PeerMetadata, presence: &PeerPresence) -> bool {
+    let mut changed = false;
+    if peer.base_url.as_deref() != Some(presence.base_url.as_str()) {
+        peer.base_url = Some(presence.base_url.clone());
+        changed = true;
+    }
+    if peer.last_seen_at != Some(presence.last_seen_at) {
+        peer.last_seen_at = Some(presence.last_seen_at);
+        changed = true;
+    }
+
+    changed
+}
+
 fn upsert_trusted_peer(store: &mut CollaborationStore, peer: PeerMetadata) {
     store
         .trusted_peers
@@ -1786,6 +2597,7 @@ fn resolve_subscription_peer(
 
 fn resolve_paired_baseline_peer(
     store: &CollaborationStore,
+    peer_presence: &HashMap<String, PeerPresence>,
     request: &collaboration::BaselineSummaryRequest,
 ) -> Result<PeerMetadata, AppError> {
     let requested_base_url = if request.peer_base_url.trim().is_empty() {
@@ -1812,11 +2624,12 @@ fn resolve_paired_baseline_peer(
             .base_url
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("paired peer has no baseUrl".to_string()))?;
+        let discovered_base_url =
+            fresh_peer_presence(peer_presence, peer_id).map(|presence| presence.base_url.as_str());
 
-        if requested_base_url
-            .as_deref()
-            .is_some_and(|base_url| base_url != peer_base_url)
-        {
+        if requested_base_url.as_deref().is_some_and(|base_url| {
+            base_url != peer_base_url && Some(base_url) != discovered_base_url
+        }) {
             return Err(AppError::BadRequest(
                 "peerBaseUrl does not match the paired peer".to_string(),
             ));
@@ -1895,10 +2708,83 @@ fn local_collaboration_config(
         display_name: local_peer.display_name,
         base_url: local_peer.base_url.unwrap_or(fallback_base_url),
         bind_address: config.bind_addr.to_string(),
+        lan_base_urls: local_lan_base_urls(config),
         peer_token_configured: effective_local_peer_token(store, config).is_some(),
         peer_token: effective_local_peer_token(store, config),
         lan_discovery_enabled: config.lan_discovery_enabled,
     }
+}
+
+fn local_lan_base_urls(config: &Config) -> Vec<String> {
+    let port = config.bind_addr.port();
+    let mut ips = Vec::new();
+
+    match config.bind_addr.ip() {
+        IpAddr::V4(ip) if is_shareable_ipv4(ip) => ips.push(ip),
+        IpAddr::V6(_) => {}
+        _ => ips.extend(local_candidate_ipv4s()),
+    }
+
+    let mut urls = Vec::new();
+    for ip in ips {
+        let url = format!("http://{ip}:{port}");
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+
+    urls
+}
+
+fn local_candidate_ipv4s() -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        for interface in ["en0", "en1"] {
+            if let Some(ip) = macos_interface_ipv4(interface) {
+                ips.push(ip);
+            }
+        }
+    }
+
+    if let Some(ip) = outbound_ipv4() {
+        ips.push(ip);
+    }
+
+    ips.into_iter()
+        .filter(|ip| is_shareable_ipv4(*ip))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_interface_ipv4(interface: &str) -> Option<Ipv4Addr> {
+    let output = Command::new("ipconfig")
+        .args(["getifaddr", interface])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<Ipv4Addr>()
+        .ok()
+}
+
+fn outbound_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    }
+}
+
+fn is_shareable_ipv4(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast())
 }
 
 fn effective_local_peer_token(store: &CollaborationStore, config: &Config) -> Option<String> {
@@ -2124,6 +3010,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2188,6 +3075,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2247,6 +3135,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2305,6 +3194,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2398,6 +3288,340 @@ mod tests {
         fs::remove_dir_all(temp_dir).ok();
     }
 
+    #[tokio::test]
+    async fn collaboration_state_refreshes_trusted_peer_from_presence() {
+        let temp_dir = unique_temp_dir("trusted-peer-presence-url");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let collaboration_path = temp_dir.join("collaboration.json");
+        let old_seen_at = Utc::now() - Duration::minutes(5);
+        let presence_seen_at = Utc::now();
+        let peer = PeerMetadata {
+            peer_id: "peer_cli".to_string(),
+            display_name: "CLI-Peer".to_string(),
+            trusted: true,
+            public_key: None,
+            base_url: Some("http://192.168.0.228:4101".to_string()),
+            last_seen_at: Some(old_seen_at),
+            access_token: Some("stored-token".to_string()),
+        };
+        let same_url_peer = PeerMetadata {
+            peer_id: "peer_same_url".to_string(),
+            display_name: "Same URL Peer".to_string(),
+            trusted: true,
+            public_key: None,
+            base_url: Some("http://10.112.12.164:4101".to_string()),
+            last_seen_at: Some(old_seen_at),
+            access_token: None,
+        };
+        let state = Arc::new(AppState {
+            config: Config {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                data_dir: temp_dir.clone(),
+                metadata_path: temp_dir.join("metadata.json"),
+                collaboration_path: collaboration_path.clone(),
+                peer_token: None,
+                lan_discovery_enabled: false,
+                peer_display_name: "Local".to_string(),
+                archive_dir: temp_dir.join("archive"),
+                max_preview_bytes: 1024,
+                stale_after_days: 15,
+            },
+            lan_discovery: Mutex::new(None),
+            active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
+            inner: RwLock::new(AppData {
+                metadata: MetadataFile::default(),
+                collaboration: CollaborationStore {
+                    trusted_peers: vec![peer, same_url_peer],
+                    ..CollaborationStore::default()
+                },
+                peer_presence: HashMap::from([
+                    (
+                        "peer_cli".to_string(),
+                        PeerPresence {
+                            peer_id: "peer_cli".to_string(),
+                            service_name: "CLI-Peer._csm-codex._tcp.local.".to_string(),
+                            display_name: "CLI-Peer".to_string(),
+                            version: Some("0.1.0".to_string()),
+                            base_url: "http://10.112.12.163:4101".to_string(),
+                            host_name: "cli-peer.local.".to_string(),
+                            port: 4101,
+                            last_seen_at: presence_seen_at,
+                        },
+                    ),
+                    (
+                        "peer_same_url".to_string(),
+                        PeerPresence {
+                            peer_id: "peer_same_url".to_string(),
+                            service_name: "Same-URL-Peer._csm-codex._tcp.local.".to_string(),
+                            display_name: "Same URL Peer".to_string(),
+                            version: Some("0.1.0".to_string()),
+                            base_url: "http://10.112.12.164:4101".to_string(),
+                            host_name: "same-url-peer.local.".to_string(),
+                            port: 4101,
+                            last_seen_at: presence_seen_at,
+                        },
+                    ),
+                ]),
+                sessions: HashMap::new(),
+                workspace_path: None,
+                stale_after_days: 15,
+            }),
+        });
+
+        let response = get_collaboration_state(State(state.clone()))
+            .await
+            .expect("get collaboration state")
+            .0;
+
+        let refreshed_peer = response
+            .store
+            .trusted_peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer_cli")
+            .expect("refreshed peer");
+        assert_eq!(
+            refreshed_peer.base_url.as_deref(),
+            Some("http://10.112.12.163:4101")
+        );
+        assert_eq!(refreshed_peer.last_seen_at, Some(presence_seen_at));
+        assert_eq!(refreshed_peer.access_token.as_deref(), Some("stored-token"));
+
+        let refreshed_same_url_peer = response
+            .store
+            .trusted_peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer_same_url")
+            .expect("same-url peer");
+        assert_eq!(
+            refreshed_same_url_peer.base_url.as_deref(),
+            Some("http://10.112.12.164:4101")
+        );
+        assert_eq!(refreshed_same_url_peer.last_seen_at, Some(presence_seen_at));
+
+        let stored =
+            storage::load_collaboration_store(&collaboration_path).expect("load saved store");
+        let stored_peer = stored
+            .trusted_peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer_cli")
+            .expect("stored peer");
+        let stored_same_url_peer = stored
+            .trusted_peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer_same_url")
+            .expect("stored same-url peer");
+        assert_eq!(
+            stored_peer.base_url.as_deref(),
+            Some("http://10.112.12.163:4101")
+        );
+        assert_eq!(stored_peer.last_seen_at, Some(presence_seen_at));
+        assert_eq!(stored_same_url_peer.last_seen_at, Some(presence_seen_at));
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_trusted_peer_removes_peer_artifacts() {
+        let temp_dir = unique_temp_dir("delete-trusted-peer");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let state = test_state(&temp_dir, HashMap::new());
+        let now = Utc::now();
+        let peer = PeerMetadata {
+            peer_id: "peer_remove".to_string(),
+            display_name: "Remove Me".to_string(),
+            trusted: true,
+            public_key: None,
+            base_url: Some("http://127.0.0.1:4101".to_string()),
+            last_seen_at: Some(now),
+            access_token: Some("secret".to_string()),
+        };
+        let kept_peer = PeerMetadata {
+            peer_id: "peer_keep".to_string(),
+            display_name: "Keep Me".to_string(),
+            trusted: true,
+            public_key: None,
+            base_url: Some("http://127.0.0.1:4102".to_string()),
+            last_seen_at: Some(now),
+            access_token: None,
+        };
+        {
+            let mut inner = state.inner.write().await;
+            inner.collaboration.trusted_peers = vec![peer.clone(), kept_peer.clone()];
+            inner.collaboration.sources = vec![
+                CollaborationSource {
+                    source_id: peer.peer_id.clone(),
+                    kind: CollaborationSourceKind::LanPeer,
+                    display_name: peer.display_name.clone(),
+                    session_root: None,
+                    peer_id: Some(peer.peer_id.clone()),
+                    enabled: true,
+                    created_at: now,
+                },
+                CollaborationSource {
+                    source_id: kept_peer.peer_id.clone(),
+                    kind: CollaborationSourceKind::LanPeer,
+                    display_name: kept_peer.display_name.clone(),
+                    session_root: None,
+                    peer_id: Some(kept_peer.peer_id.clone()),
+                    enabled: true,
+                    created_at: now,
+                },
+            ];
+            inner.collaboration.subscriptions = vec![
+                Subscription {
+                    subscription_id: "sub_remove".to_string(),
+                    peer_id: peer.peer_id.clone(),
+                    project_id: "project_1".to_string(),
+                    status: SubscriptionStatus::Active,
+                    topics: Vec::new(),
+                    created_at: now,
+                    baseline_generated_at: None,
+                    analysis_cycle: AnalysisCycle::Hourly,
+                    next_run_at: None,
+                    last_run_at: None,
+                    last_run_status: None,
+                    last_run_error: None,
+                },
+                Subscription {
+                    subscription_id: "sub_keep".to_string(),
+                    peer_id: kept_peer.peer_id.clone(),
+                    project_id: "project_1".to_string(),
+                    status: SubscriptionStatus::Active,
+                    topics: Vec::new(),
+                    created_at: now,
+                    baseline_generated_at: None,
+                    analysis_cycle: AnalysisCycle::Hourly,
+                    next_run_at: None,
+                    last_run_at: None,
+                    last_run_status: None,
+                    last_run_error: None,
+                },
+            ];
+            inner.collaboration.delta_cursors = vec![
+                SessionDeltaCursor {
+                    source_id: peer.peer_id.clone(),
+                    session_path: "subscription:sub_remove".to_string(),
+                    last_offset: 0,
+                    last_record_timestamp: Some(now),
+                    last_record_hash: Some("remove".to_string()),
+                    updated_at: now,
+                },
+                SessionDeltaCursor {
+                    source_id: kept_peer.peer_id.clone(),
+                    session_path: "subscription:sub_keep".to_string(),
+                    last_offset: 0,
+                    last_record_timestamp: Some(now),
+                    last_record_hash: Some("keep".to_string()),
+                    updated_at: now,
+                },
+            ];
+            inner.collaboration.summaries = vec![
+                CollaborationSummary {
+                    summary_id: "summary_remove".to_string(),
+                    project_id: "project_1".to_string(),
+                    source_ids: vec![peer.peer_id.clone()],
+                    markdown: "remove".to_string(),
+                    generated_at: now,
+                    active_since: now,
+                    engine: "test".to_string(),
+                },
+                CollaborationSummary {
+                    summary_id: "summary_keep".to_string(),
+                    project_id: "project_1".to_string(),
+                    source_ids: vec![kept_peer.peer_id.clone()],
+                    markdown: "keep".to_string(),
+                    generated_at: now,
+                    active_since: now,
+                    engine: "test".to_string(),
+                },
+            ];
+            inner.peer_presence = HashMap::from([
+                (
+                    peer.peer_id.clone(),
+                    PeerPresence {
+                        peer_id: peer.peer_id.clone(),
+                        service_name: "Remove-Me._csm-codex._tcp.local.".to_string(),
+                        display_name: peer.display_name.clone(),
+                        version: Some("0.1.0".to_string()),
+                        base_url: "http://127.0.0.1:4101".to_string(),
+                        host_name: "remove-me.local.".to_string(),
+                        port: 4101,
+                        last_seen_at: now,
+                    },
+                ),
+                (
+                    kept_peer.peer_id.clone(),
+                    PeerPresence {
+                        peer_id: kept_peer.peer_id.clone(),
+                        service_name: "Keep-Me._csm-codex._tcp.local.".to_string(),
+                        display_name: kept_peer.display_name.clone(),
+                        version: Some("0.1.0".to_string()),
+                        base_url: "http://127.0.0.1:4102".to_string(),
+                        host_name: "keep-me.local.".to_string(),
+                        port: 4102,
+                        last_seen_at: now,
+                    },
+                ),
+            ]);
+        }
+
+        let response = delete_trusted_peer(Path(peer.peer_id.clone()), State(state.clone()))
+            .await
+            .expect("delete trusted peer")
+            .0;
+
+        assert_eq!(response.store.trusted_peers.len(), 1);
+        assert_eq!(response.store.trusted_peers[0].peer_id, kept_peer.peer_id);
+        assert!(
+            response
+                .store
+                .sources
+                .iter()
+                .all(|source| source.source_id != peer.peer_id)
+        );
+        assert!(
+            response
+                .store
+                .subscriptions
+                .iter()
+                .all(|subscription| subscription.peer_id != peer.peer_id)
+        );
+        assert!(
+            response
+                .store
+                .delta_cursors
+                .iter()
+                .all(|cursor| cursor.source_id != peer.peer_id)
+        );
+        assert!(
+            response
+                .store
+                .summaries
+                .iter()
+                .all(|summary| !summary.source_ids.contains(&peer.peer_id))
+        );
+        assert!(
+            response
+                .discovered_peers
+                .iter()
+                .all(|presence| presence.peer_id != peer.peer_id)
+        );
+        assert!(
+            response
+                .discovered_peers
+                .iter()
+                .any(|presence| presence.peer_id == kept_peer.peer_id)
+        );
+
+        let stored = storage::load_collaboration_store(&state.config.collaboration_path)
+            .expect("load saved collaboration store");
+        assert_eq!(stored.trusted_peers.len(), 1);
+        assert_eq!(stored.trusted_peers[0].peer_id, kept_peer.peer_id);
+
+        fs::remove_dir_all(temp_dir).ok();
+    }
+
     #[test]
     fn incremental_cursor_drops_processed_delta_and_keeps_same_timestamp_tail() {
         let timestamp = Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
@@ -2466,6 +3690,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore {
@@ -2504,6 +3729,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),
@@ -2573,6 +3799,7 @@ mod tests {
 
         let resolved = resolve_paired_baseline_peer(
             &store,
+            &HashMap::new(),
             &collaboration::BaselineSummaryRequest {
                 peer_base_url: "http://127.0.0.1:4001".to_string(),
                 peer_access_token: None,
@@ -2590,6 +3817,7 @@ mod tests {
 
         let rejected = resolve_paired_baseline_peer(
             &store,
+            &HashMap::new(),
             &collaboration::BaselineSummaryRequest {
                 peer_base_url: "http://127.0.0.1:4999".to_string(),
                 peer_access_token: None,
@@ -2748,6 +3976,7 @@ mod tests {
             },
             lan_discovery: Mutex::new(None),
             active_incremental_runs: Mutex::new(HashSet::new()),
+            mount_cache: std::sync::Arc::new(crate::mounts::router::MountCache::default()),
             inner: RwLock::new(AppData {
                 metadata: MetadataFile::default(),
                 collaboration: CollaborationStore::default(),

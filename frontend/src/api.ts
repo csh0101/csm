@@ -2,6 +2,7 @@ import {
   ScanResponse,
   SettingsResponse,
   SessionMutationResponse,
+  SessionContentResponse,
   SessionsResponse,
   ActivitySummaryResponse,
   CollaborationStateResponse,
@@ -176,6 +177,31 @@ export function updatePeerAccessToken(peerId: string, peerAccessToken: string) {
   );
 }
 
+export function updateTrustedPeerConnection(
+  peerId: string,
+  payload: {
+    peerBaseUrl?: string;
+    peerAccessToken?: string;
+  }
+) {
+  return requestJson<CollaborationStateResponse>(
+    `/api/collaboration/peers/${encodeURIComponent(peerId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export function deleteTrustedPeer(peerId: string) {
+  return requestJson<CollaborationStateResponse>(
+    `/api/collaboration/peers/${encodeURIComponent(peerId)}`,
+    {
+      method: 'DELETE',
+    }
+  );
+}
+
 export function updateSharePolicy(
   projectId: string,
   payload: {
@@ -291,6 +317,17 @@ export function updateSessionNotes(id: string, notes: string) {
   return requestJson<SessionMutationResponse>(`/api/sessions/${id}/notes`, {
     method: 'PATCH',
     body: JSON.stringify({ notes }),
+  });
+}
+
+export function fetchSessionContent(id: string) {
+  return requestJson<SessionContentResponse>(`/api/sessions/${id}/content`);
+}
+
+export function updateSessionContent(id: string, content: string) {
+  return requestJson<SessionMutationResponse>(`/api/sessions/${id}/content`, {
+    method: 'PATCH',
+    body: JSON.stringify({ content }),
   });
 }
 

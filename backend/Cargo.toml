@@ -19,3 +19,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v5"] }
 walkdir = "2"
 mdns-sd = "0.19.1"
+async-trait = "0.1.89"
+mysql_async = "0.36.2"
+url = "2.5.8"
+fuser = { version = "0.15", optional = true }
+libc = "0.2"
+
+[features]
+default = []
+fuse-mounts = ["dep:fuser"]

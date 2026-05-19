@@ -5,6 +5,7 @@ pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod models;
+pub mod mounts;
 pub mod project;
 pub mod scanner;
 pub mod scheduler;

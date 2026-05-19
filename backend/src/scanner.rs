@@ -87,7 +87,7 @@ pub fn scan_workspace(
             continue;
         }
 
-        match scan_file(entry.path(), metadata, max_preview_bytes, stale_after_days) {
+        match scan_session_file(entry.path(), metadata, max_preview_bytes, stale_after_days) {
             Ok(session) => sessions.push(session),
             Err(_) => skipped_files += 1,
         }
@@ -102,7 +102,7 @@ pub fn scan_workspace(
     })
 }
 
-fn scan_file(
+pub fn scan_session_file(
     path: &Path,
     metadata_file: &MetadataFile,
     max_preview_bytes: usize,

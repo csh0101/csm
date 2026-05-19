@@ -24,6 +24,8 @@ import { cn } from './lib/utils';
 import {
   archiveDeleteSession,
   createCollaborationSubscription,
+  deleteTrustedPeer,
+  fetchSessionContent,
   fetchCollaborationPeerProjects,
   fetchSessions,
   fetchCollaborationState,
@@ -33,12 +35,13 @@ import {
   restoreSession,
   scanSessions,
   updateLocalCollaborationConfig,
-  updatePeerAccessToken,
   updateSubscriptionSchedule,
   updateSharePolicy,
   updateSessionLabels,
   updateSessionNotes,
+  updateSessionContent,
   updateSettings,
+  updateTrustedPeerConnection,
 } from './api';
 
 const DEFAULT_STALE_AFTER_DAYS = 15;
@@ -63,6 +66,55 @@ function normalizePeerBaseUrl(value: string) {
   const trimmed = value.trim().replace(/\/+$/, '');
   if (!trimmed) return '';
   return trimmed.includes('://') ? trimmed : `http://${trimmed}`;
+}
+
+function errorMessageFrom(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function formatCollaborationError(
+  error: unknown,
+  fallback: string,
+  t: (key: string, params?: Record<string, string | number>) => string
+) {
+  const message = errorMessageFrom(error, fallback);
+  const normalized = message.toLowerCase();
+
+  if (
+    normalized.includes('failed to reach peer') ||
+    normalized.includes('error sending request') ||
+    normalized.includes('failed to fetch') ||
+    normalized.includes("couldn't connect") ||
+    normalized.includes('connection refused') ||
+    normalized.includes('timed out')
+  ) {
+    return [
+      t('error_collaboration_peer_unreachable'),
+      t('error_collaboration_peer_unreachable_hint'),
+      t('error_details', { message }),
+    ].join('\n');
+  }
+
+  if (
+    normalized.includes('http 401') ||
+    normalized.includes('http 403') ||
+    normalized.includes('peer rejected read api')
+  ) {
+    return [
+      t('error_collaboration_peer_rejected'),
+      t('error_collaboration_peer_rejected_hint'),
+      t('error_details', { message }),
+    ].join('\n');
+  }
+
+  if (normalized.includes('invalid json')) {
+    return [
+      t('error_collaboration_peer_invalid_response'),
+      t('error_details', { message }),
+    ].join('\n');
+  }
+
+  return message;
 }
 
 export default function App() {
@@ -90,6 +142,7 @@ export default function App() {
   const [peerAccessToken, setPeerAccessToken] = useState('');
   const [selectedPeerId, setSelectedPeerId] = useState('');
   const selectedPeerIdRef = useRef('');
+  const hasInitializedCollaborationSelectionRef = useRef(false);
   const [peerProjects, setPeerProjects] = useState<PeerProject[]>([]);
   const [collaborationProjectId, setCollaborationProjectId] = useState('');
   const [collaborationSummaryDays, setCollaborationSummaryDays] = useState(7);
@@ -98,6 +151,7 @@ export default function App() {
   const [isLoadingPeerProjects, setIsLoadingPeerProjects] = useState(false);
   const [isSavingSharePolicy, setIsSavingSharePolicy] = useState(false);
   const [isUpdatingPeerToken, setIsUpdatingPeerToken] = useState(false);
+  const [isDeletingPeer, setIsDeletingPeer] = useState(false);
   const [isRefreshingLocalToken, setIsRefreshingLocalToken] = useState(false);
   const [generatingCollaborationProjectIds, setGeneratingCollaborationProjectIds] = useState<string[]>([]);
   const generatingCollaborationProjectIdsRef = useRef<Set<string>>(new Set());
@@ -105,6 +159,8 @@ export default function App() {
   const [latestCollaborationSummary, setLatestCollaborationSummary] = useState<CollaborationSummary | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
+  const [collaborationErrorMessage, setCollaborationErrorMessage] = useState<string | null>(null);
+  const [collaborationNoticeMessage, setCollaborationNoticeMessage] = useState<string | null>(null);
   const appStartedAtRef = useRef(Date.now());
   const [showNotifications, setShowNotifications] = useState(false);
   const [readNotificationIds, setReadNotificationIds] = useState<string[]>([]);
@@ -139,8 +195,8 @@ export default function App() {
       setIsLoadingPeerProjects(true);
     }
     if (reportErrors) {
-      setErrorMessage(null);
-      setNoticeMessage(null);
+      setCollaborationErrorMessage(null);
+      setCollaborationNoticeMessage(null);
     }
     try {
       const projects = await fetchCollaborationPeerProjects(peerId);
@@ -148,7 +204,7 @@ export default function App() {
       setCollaborationProjectId(projects[0]?.projectId || '');
     } catch (error) {
       if (reportErrors) {
-        setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_projects_failed'));
+        setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_projects_failed'), t));
       }
     } finally {
       if (showLoading) {
@@ -182,7 +238,17 @@ export default function App() {
     }
     try {
       const response = await fetchCollaborationState();
-      const nextSelectedPeerId = selectedPeerIdRef.current || response.store.trustedPeers[0]?.peerId || '';
+      const currentPeerId = selectedPeerIdRef.current;
+      const currentPeerStillExists = response.store.trustedPeers.some(
+        (peer) => peer.peerId === currentPeerId
+      );
+      const nextSelectedPeerId =
+        currentPeerId && currentPeerStillExists
+          ? currentPeerId
+          : !hasInitializedCollaborationSelectionRef.current
+            ? response.store.trustedPeers[0]?.peerId || ''
+            : '';
+      hasInitializedCollaborationSelectionRef.current = true;
       setCollaborationState(response);
       setCollaborationProjectId((current) => current || response.projects[0]?.projectId || '');
       selectedPeerIdRef.current = nextSelectedPeerId;
@@ -191,7 +257,7 @@ export default function App() {
         void loadProjectsForPeer(nextSelectedPeerId, response.store.trustedPeers, false, false);
       }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_load_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_load_failed'), t));
     } finally {
       if (showLoading) {
         setIsCollaborationLoading(false);
@@ -383,8 +449,8 @@ export default function App() {
 
   const handleToggleSharePolicy = async (projectId: string, projectPath: string | null, enabled: boolean) => {
     setIsSavingSharePolicy(true);
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const response = await updateSharePolicy(projectId, {
         projectPath,
@@ -393,9 +459,9 @@ export default function App() {
         blockedLabels: ['private', 'secret'],
       });
       setCollaborationState(response);
-      setNoticeMessage(t('collab_share_policy_saved'));
+      setCollaborationNoticeMessage(t('collab_share_policy_saved'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_save_failed'), t));
     } finally {
       setIsSavingSharePolicy(false);
     }
@@ -405,52 +471,89 @@ export default function App() {
     const trimmed = displayName.trim();
     if (!trimmed) return;
 
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const response = await updateLocalCollaborationConfig({ displayName: trimmed });
       setCollaborationState(response);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_save_failed'), t));
     }
   };
 
   const handleRefreshLocalPeerToken = async () => {
     setIsRefreshingLocalToken(true);
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const response = await updateLocalCollaborationConfig({ refreshPeerToken: true });
       setCollaborationState(response);
-      setNoticeMessage(t('collab_local_token_refreshed'));
+      setCollaborationNoticeMessage(t('collab_local_token_refreshed'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_save_failed'), t));
     } finally {
       setIsRefreshingLocalToken(false);
     }
   };
 
-  const handleUpdatePeerAccessToken = async (peerId: string, token: string) => {
-    const trimmed = token.trim();
-    if (!trimmed) return;
+  const handleUpdatePeerConnection = async (peerId: string, baseUrl: string, token?: string) => {
+    const normalizedPeerBaseUrl = normalizePeerBaseUrl(baseUrl);
+    if (!peerId || !normalizedPeerBaseUrl) return;
+    const trimmedToken = token?.trim();
 
     setIsUpdatingPeerToken(true);
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
-      const response = await updatePeerAccessToken(peerId, trimmed);
+      const response = await updateTrustedPeerConnection(peerId, {
+        peerBaseUrl: normalizedPeerBaseUrl,
+        peerAccessToken: trimmedToken || undefined,
+      });
       setCollaborationState(response);
+      setPeerBaseUrl(normalizedPeerBaseUrl);
       setPeerAccessToken('');
+      setCollaborationNoticeMessage(t('collab_peer_connection_saved'));
       if (peerId === selectedPeerId) {
-        const projects = await fetchCollaborationPeerProjects(peerId);
-        setPeerProjects(projects);
-        setCollaborationProjectId(projects[0]?.projectId || '');
+        try {
+          const projects = await fetchCollaborationPeerProjects(peerId);
+          setPeerProjects(projects);
+          setCollaborationProjectId(projects[0]?.projectId || '');
+        } catch (error) {
+          setPeerProjects([]);
+          setCollaborationProjectId('');
+          setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_projects_failed'), t));
+        }
       }
-      setNoticeMessage(t('collab_peer_token_saved'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_save_failed'), t));
     } finally {
       setIsUpdatingPeerToken(false);
+    }
+  };
+
+  const handleDeleteTrustedPeer = async (peerId: string) => {
+    if (!peerId || isDeletingPeer) return;
+
+    setIsDeletingPeer(true);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
+    try {
+      const response = await deleteTrustedPeer(peerId);
+      setCollaborationState(response);
+      if (selectedPeerIdRef.current === peerId) {
+        selectedPeerIdRef.current = '';
+        setSelectedPeerId('');
+        setPeerBaseUrl('');
+        setPeerAccessToken('');
+        setPeerProjects([]);
+        setCollaborationProjectId('');
+        setLatestCollaborationSummary(null);
+      }
+      setCollaborationNoticeMessage(t('collab_peer_deleted'));
+    } catch (error) {
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_delete_peer_failed'), t));
+    } finally {
+      setIsDeletingPeer(false);
     }
   };
 
@@ -458,8 +561,8 @@ export default function App() {
     if (!peerBaseUrl.trim()) return;
 
     setIsPairingPeer(true);
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const normalizedPeerBaseUrl = normalizePeerBaseUrl(peerBaseUrl);
       setPeerBaseUrl(normalizedPeerBaseUrl);
@@ -472,9 +575,9 @@ export default function App() {
       selectedPeerIdRef.current = response.peer.peerId;
       setSelectedPeerId(response.peer.peerId);
       setPeerAccessToken('');
-      setNoticeMessage(t('collab_peer_paired'));
+      setCollaborationNoticeMessage(t('collab_peer_paired'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_pair_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_pair_failed'), t));
     } finally {
       setIsPairingPeer(false);
     }
@@ -485,6 +588,8 @@ export default function App() {
     selectedPeerIdRef.current = '';
     setSelectedPeerId('');
     setPeerProjects([]);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
   };
 
   const handleSelectPeer = async (peerId: string) => {
@@ -508,8 +613,8 @@ export default function App() {
     setGeneratingCollaborationProjectIds((current) =>
       current.includes(targetProjectId) ? current : [...current, targetProjectId]
     );
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const normalizedPeerBaseUrl = normalizePeerBaseUrl(peerBaseUrl);
       if (!selectedPeerId) {
@@ -529,9 +634,9 @@ export default function App() {
       selectedPeerIdRef.current = response.subscription.peerId;
       setSelectedPeerId(response.subscription.peerId);
       setCollaborationProjectId(response.subscription.projectId);
-      setNoticeMessage(t('collab_subscription_created'));
+      setCollaborationNoticeMessage(t('collab_subscription_created'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_summary_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_summary_failed'), t));
     } finally {
       generatingCollaborationProjectIdsRef.current.delete(targetProjectId);
       setGeneratingCollaborationProjectIds((current) => current.filter((id) => id !== targetProjectId));
@@ -545,8 +650,8 @@ export default function App() {
     if (!subscription) return;
 
     setIsRefreshingCollaboration(true);
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const response = await generateCollaborationIncremental({
         subscriptionId: subscription.subscriptionId,
@@ -555,9 +660,9 @@ export default function App() {
       });
       setCollaborationState(response.state);
       setLatestCollaborationSummary(response.summary);
-      setNoticeMessage(t('collab_incremental_created'));
+      setCollaborationNoticeMessage(t('collab_incremental_created'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_incremental_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_incremental_failed'), t));
     } finally {
       setIsRefreshingCollaboration(false);
     }
@@ -567,14 +672,14 @@ export default function App() {
     subscriptionId: string,
     analysisCycle: '10m' | '1h' | 'manual'
   ) => {
-    setErrorMessage(null);
-    setNoticeMessage(null);
+    setCollaborationErrorMessage(null);
+    setCollaborationNoticeMessage(null);
     try {
       const response = await updateSubscriptionSchedule(subscriptionId, analysisCycle);
       setCollaborationState(response);
-      setNoticeMessage(t('collab_schedule_saved'));
+      setCollaborationNoticeMessage(t('collab_schedule_saved'));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : t('error_collaboration_save_failed'));
+      setCollaborationErrorMessage(formatCollaborationError(error, t('error_collaboration_save_failed'), t));
     }
   };
 
@@ -669,6 +774,23 @@ export default function App() {
       replaceSession(response.session);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : t('error_save_failed'));
+    } finally {
+      setIsMutating(false);
+    }
+  };
+
+  const handleUpdateContent = async (id: string, content: string) => {
+    setIsMutating(true);
+    setErrorMessage(null);
+    setNoticeMessage(null);
+    try {
+      const response = await updateSessionContent(id, content);
+      replaceSession(response.session);
+      setNoticeMessage(t('content_editor_saved'));
+      return response;
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : t('error_save_session_content_failed'));
+      throw error;
     } finally {
       setIsMutating(false);
     }
@@ -883,6 +1005,8 @@ export default function App() {
               onRestore={handleRestore}
               onUpdateLabels={handleUpdateLabels}
               onUpdateNotes={handleUpdateNotes}
+              onLoadContent={fetchSessionContent}
+              onUpdateContent={handleUpdateContent}
               isBusy={isMutating}
             />
           )}
@@ -906,21 +1030,23 @@ export default function App() {
           isPairingPeer={isPairingPeer}
           isLoadingPeerProjects={isLoadingPeerProjects}
           isUpdatingPeerToken={isUpdatingPeerToken}
+          isDeletingPeer={isDeletingPeer}
           isRefreshingLocalToken={isRefreshingLocalToken}
           generatingProjectIds={generatingCollaborationProjectIds}
           isRefreshingIncremental={isRefreshingCollaboration}
           onRefresh={loadCollaborationState}
           onLocalDisplayNameChange={handleUpdateLocalDisplayName}
           onRefreshLocalPeerToken={handleRefreshLocalPeerToken}
-          onUpdatePeerAccessToken={handleUpdatePeerAccessToken}
+          onUpdatePeerConnection={handleUpdatePeerConnection}
+          onDeletePeer={handleDeleteTrustedPeer}
           onPairPeer={handlePairPeer}
           onUseDiscoveredPeer={handleUseDiscoveredPeer}
           onCreateSubscription={handleCreateCollaborationSubscription}
           onGenerateIncremental={handleGenerateCollaborationIncremental}
           onUpdateSubscriptionSchedule={handleUpdateSubscriptionSchedule}
           latestSummary={latestCollaborationSummary}
-          errorMessage={errorMessage}
-          noticeMessage={noticeMessage}
+          errorMessage={collaborationErrorMessage}
+          noticeMessage={collaborationNoticeMessage}
         />
       )}
 
