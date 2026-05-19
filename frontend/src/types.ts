@@ -75,6 +75,15 @@ export interface ActivitySummaryResponse {
   engine: string;
 }
 
+export interface SessionContentResponse {
+  sessionId: string;
+  path: string;
+  content: string;
+  format: 'json' | 'jsonl' | 'text';
+  size: number;
+  lastModified: string;
+}
+
 export interface ProjectIdentity {
   projectId: string;
   rootPath?: string | null;
@@ -168,6 +177,7 @@ export interface LocalCollaborationConfig {
   displayName: string;
   baseUrl: string;
   bindAddress: string;
+  lanBaseUrls: string[];
   peerToken?: string | null;
   peerTokenConfigured: boolean;
   lanDiscoveryEnabled: boolean;

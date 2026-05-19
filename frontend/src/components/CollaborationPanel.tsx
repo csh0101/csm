@@ -6,11 +6,13 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock,
+  Copy,
   KeyRound,
   RotateCcw,
   RefreshCw,
   Settings,
   ShieldCheck,
+  Trash2,
   Users,
   Wifi,
   XCircle,
@@ -44,13 +46,15 @@ interface CollaborationPanelProps {
   isPairingPeer: boolean;
   isLoadingPeerProjects: boolean;
   isUpdatingPeerToken: boolean;
+  isDeletingPeer: boolean;
   isRefreshingLocalToken: boolean;
   generatingProjectIds: string[];
   isRefreshingIncremental: boolean;
   onRefresh: () => void;
   onLocalDisplayNameChange: (value: string) => void | Promise<void>;
   onRefreshLocalPeerToken: () => void | Promise<void>;
-  onUpdatePeerAccessToken: (peerId: string, token: string) => void | Promise<void>;
+  onUpdatePeerConnection: (peerId: string, baseUrl: string, token?: string) => void | Promise<void>;
+  onDeletePeer: (peerId: string) => void | Promise<void>;
   onPairPeer: () => void;
   onUseDiscoveredPeer: (peer: PeerPresence) => void;
   onCreateSubscription: (projectId?: string, analysisCycle?: AnalysisCycleValue) => void;
@@ -104,13 +108,15 @@ export function CollaborationPanel({
   isPairingPeer,
   isLoadingPeerProjects,
   isUpdatingPeerToken,
+  isDeletingPeer,
   isRefreshingLocalToken,
   generatingProjectIds,
   isRefreshingIncremental,
   onRefresh,
   onLocalDisplayNameChange,
   onRefreshLocalPeerToken,
-  onUpdatePeerAccessToken,
+  onUpdatePeerConnection,
+  onDeletePeer,
   onPairPeer,
   onUseDiscoveredPeer,
   onCreateSubscription,
@@ -127,14 +133,21 @@ export function CollaborationPanel({
   const [analysisPrompt, setAnalysisPrompt] = useState('');
   const [analysisCycle, setAnalysisCycle] = useState<AnalysisCycleValue>('1h');
   const [localDisplayNameDraft, setLocalDisplayNameDraft] = useState('');
-  const [tokenEditorPeerId, setTokenEditorPeerId] = useState<string | null>(null);
-  const [tokenEditorDraft, setTokenEditorDraft] = useState('');
+  const [connectionEditorPeerId, setConnectionEditorPeerId] = useState<string | null>(null);
+  const [connectionEditorBaseUrl, setConnectionEditorBaseUrl] = useState('');
+  const [connectionEditorToken, setConnectionEditorToken] = useState('');
   const [copiedSummaryId, setCopiedSummaryId] = useState<string | null>(null);
+  const [copiedLocalField, setCopiedLocalField] = useState<'url' | 'port' | 'token' | null>(null);
+  const [localShareExpanded, setLocalShareExpanded] = useState(false);
+  const [showLocalToken, setShowLocalToken] = useState(false);
+  const [manualPairingOpen, setManualPairingOpen] = useState(false);
+  const [deleteConfirmPeerId, setDeleteConfirmPeerId] = useState<string | null>(null);
   const peers = state?.store.trustedPeers ?? [];
   const discoveredPeers = state?.discoveredPeers ?? [];
   const summaries = state?.store.summaries ?? [];
   const localConfig = state?.localConfig;
   const port = localPort(localConfig?.baseUrl, localConfig?.bindAddress);
+  const localShareUrl = localConfig?.lanBaseUrls?.[0] ?? '';
   const selectedPeer = peers.find((peer) => peer.peerId === selectedPeerId) ?? null;
   const selectedDiscoveredPeer = !selectedPeerId
     ? discoveredPeers.find((peer) => peerBaseUrl === peer.baseUrl) ?? null
@@ -142,6 +155,7 @@ export function CollaborationPanel({
   const selectedDetailProject = selectedDetailProjectId
     ? peerProjects.find((project) => project.projectId === selectedDetailProjectId) ?? null
     : null;
+  const showPairingPanel = manualPairingOpen || !selectedPeer;
   const activeSummaryProjectId = selectedDetailProjectId ?? selectedProjectId;
   const activeSummaries = useMemo(() => {
     if (!activeSummaryProjectId) return [];
@@ -215,6 +229,7 @@ export function CollaborationPanel({
   );
 
   const choosePeer = (card: (typeof peerCards)[number]) => {
+    setManualPairingOpen(false);
     if (card.kind === 'paired') {
       onSelectedPeerIdChange(card.id);
       setSelectedDetailProjectId(null);
@@ -225,23 +240,43 @@ export function CollaborationPanel({
     setSelectedDetailProjectId(null);
   };
 
-  const openTokenEditor = (peerId: string) => {
-    setTokenEditorPeerId(peerId);
-    setTokenEditorDraft('');
+  const openManualPairing = () => {
+    setManualPairingOpen(true);
+    onSelectedPeerIdChange('');
+    onPeerBaseUrlChange('');
+    setSelectedDetailProjectId(null);
   };
 
-  const closeTokenEditor = () => {
-    setTokenEditorPeerId(null);
-    setTokenEditorDraft('');
+  const openConnectionEditor = (peerId: string) => {
+    const peer = peers.find((item) => item.peerId === peerId);
+    setConnectionEditorPeerId(peerId);
+    setConnectionEditorBaseUrl(peer?.baseUrl ?? '');
+    setConnectionEditorToken('');
   };
 
-  const savePeerToken = async () => {
-    const peerId = tokenEditorPeerId;
-    const token = tokenEditorDraft.trim();
-    if (!peerId || !token) return;
+  const closeConnectionEditor = () => {
+    setConnectionEditorPeerId(null);
+    setConnectionEditorBaseUrl('');
+    setConnectionEditorToken('');
+  };
 
-    await onUpdatePeerAccessToken(peerId, token);
-    closeTokenEditor();
+  const savePeerConnection = async () => {
+    const peerId = connectionEditorPeerId;
+    const baseUrl = connectionEditorBaseUrl.trim();
+    const token = connectionEditorToken.trim();
+    if (!peerId || !baseUrl) return;
+
+    await onUpdatePeerConnection(peerId, baseUrl, token || undefined);
+    closeConnectionEditor();
+  };
+
+  const requestDeletePeer = (peerId: string) => {
+    setDeleteConfirmPeerId(peerId);
+  };
+
+  const confirmDeletePeer = async (peerId: string) => {
+    await onDeletePeer(peerId);
+    setDeleteConfirmPeerId(null);
   };
 
   const copySummaryMarkdown = async (summary: CollaborationSummary) => {
@@ -249,6 +284,16 @@ export function CollaborationPanel({
     setCopiedSummaryId(summary.summaryId);
     window.setTimeout(() => {
       setCopiedSummaryId((current) => (current === summary.summaryId ? null : current));
+    }, 1200);
+  };
+
+  const copyLocalValue = async (field: 'url' | 'port' | 'token', value?: string | null) => {
+    if (!value) return;
+
+    await navigator.clipboard.writeText(value);
+    setCopiedLocalField(field);
+    window.setTimeout(() => {
+      setCopiedLocalField((current) => (current === field ? null : current));
     }, 1200);
   };
 
@@ -277,7 +322,12 @@ export function CollaborationPanel({
         layout === 'page' ? 'flex-1' : 'max-h-[38vh] border-t border-slate-200 xl:h-screen xl:max-h-none xl:w-80 xl:border-l xl:border-t-0'
       )}
     >
-      <header className="flex h-16 flex-shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 md:px-6">
+      <header
+        className={cn(
+          'flex h-16 flex-shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 md:px-6',
+          layout === 'page' && 'pr-16 md:pr-20'
+        )}
+      >
         <h2 className="flex items-center gap-2 text-lg font-semibold tracking-tight text-slate-800">
           <Users className="h-5 w-5 text-blue-500" />
           {t('collab_title')}
@@ -296,7 +346,7 @@ export function CollaborationPanel({
       <div className="flex-1 overflow-y-auto p-4 md:p-8">
         <div className="mx-auto max-w-5xl space-y-6">
           {errorMessage && (
-            <div className="rounded border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+            <div className="whitespace-pre-line rounded border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium leading-relaxed text-red-700">
               {errorMessage}
             </div>
           )}
@@ -306,9 +356,9 @@ export function CollaborationPanel({
             </div>
           )}
 
-          <section className="mb-6 flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm md:flex-row md:items-center md:justify-between">
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:gap-8">
-              <div>
+          <section className="mb-6 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+              <div className="min-w-0">
                 <label className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-400">
                   {t('collab_device_name')}
                 </label>
@@ -326,69 +376,146 @@ export function CollaborationPanel({
                       event.currentTarget.blur();
                     }
                   }}
-                  className="w-48 border-0 border-b border-dashed border-slate-300 bg-transparent pb-0.5 text-sm font-semibold text-slate-800 outline-none transition-colors focus:border-blue-500"
+                  className="w-56 max-w-full border-0 border-b border-dashed border-slate-300 bg-transparent pb-0.5 text-sm font-semibold text-slate-800 outline-none transition-colors focus:border-blue-500"
                 />
               </div>
-              <div className="hidden h-8 w-px bg-slate-100 sm:block"></div>
-              <div>
-                <label className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  {t('collab_port')}
-                </label>
-                <div className="rounded border border-slate-100 bg-slate-50 px-2 py-0.5 font-mono text-sm font-medium text-slate-600">
-                  {port || '-'}
-                </div>
-              </div>
-              <div className="min-w-0">
-                <label className="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  {t('collab_local_token')}
-                </label>
-                <div className="flex max-w-full items-center gap-1.5">
-                  <code
-                    className="block max-w-[15rem] truncate rounded border border-slate-100 bg-slate-50 px-2 py-0.5 font-mono text-sm font-medium text-slate-600"
-                    title={localConfig?.peerToken || ''}
-                  >
-                    {localConfig?.peerToken || '-'}
-                  </code>
-                  <button
-                    type="button"
-                    title={t('collab_refresh_local_token')}
-                    onClick={onRefreshLocalPeerToken}
-                    disabled={isRefreshingLocalToken}
-                    className="rounded border border-slate-200 p-1.5 text-slate-500 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    <RotateCcw className={cn('h-3.5 w-3.5', isRefreshingLocalToken && 'animate-spin')} />
-                  </button>
-                </div>
+
+              <div className="min-w-0 flex-1 lg:max-w-3xl">
+                <button
+                  type="button"
+                  onClick={() => setLocalShareExpanded((current) => !current)}
+                  className="flex w-full min-w-0 items-center justify-between gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-left transition-colors hover:border-blue-200 hover:bg-blue-50/30"
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-bold text-slate-800">{t('collab_local_share')}</span>
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-100 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-600">
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                        {localConfig?.lanDiscoveryEnabled ? t('collab_discovering') : t('collab_disabled')}
+                      </span>
+                      {port && (
+                        <span className="rounded border border-slate-200 bg-white px-1.5 py-0.5 font-mono text-xs font-semibold text-slate-500">
+                          {port}
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 truncate font-mono text-xs text-slate-500" title={localShareUrl || t('collab_share_url_unavailable')}>
+                      {localShareUrl || t('collab_share_url_unavailable')}
+                    </p>
+                  </div>
+                  <ChevronRight className={cn('h-4 w-4 flex-shrink-0 text-slate-400 transition-transform', localShareExpanded && 'rotate-90')} />
+                </button>
+
+                {localShareExpanded && (
+                  <div className="mt-3 divide-y divide-slate-100 rounded-lg border border-slate-100 bg-white">
+                    <div className="grid gap-2 p-3 sm:grid-cols-[8rem_1fr_auto] sm:items-center">
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">{t('collab_share_url')}</span>
+                      <code className="min-w-0 truncate rounded border border-slate-100 bg-slate-50 px-2 py-1 font-mono text-sm text-slate-700" title={localShareUrl || t('collab_share_url_unavailable')}>
+                        {localShareUrl || t('collab_share_url_unavailable')}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => copyLocalValue('url', localShareUrl)}
+                        disabled={!localShareUrl}
+                        className="inline-flex items-center justify-center gap-1.5 rounded border border-slate-200 px-2.5 py-1.5 text-xs font-bold text-slate-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {copiedLocalField === 'url' ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                        {copiedLocalField === 'url' ? t('collab_copied') : t('btn_copy_value')}
+                      </button>
+                    </div>
+                    <div className="grid gap-2 p-3 sm:grid-cols-[8rem_1fr_auto] sm:items-center">
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">{t('collab_port')}</span>
+                      <code className="min-w-0 truncate rounded border border-slate-100 bg-slate-50 px-2 py-1 font-mono text-sm text-slate-700">
+                        {port || '-'}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => copyLocalValue('port', port)}
+                        disabled={!port}
+                        className="inline-flex items-center justify-center gap-1.5 rounded border border-slate-200 px-2.5 py-1.5 text-xs font-bold text-slate-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {copiedLocalField === 'port' ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                        {copiedLocalField === 'port' ? t('collab_copied') : t('btn_copy_value')}
+                      </button>
+                    </div>
+                    <div className="grid gap-2 p-3 sm:grid-cols-[8rem_1fr_auto] sm:items-center">
+                      <span className="text-xs font-bold uppercase tracking-wider text-slate-400">{t('collab_local_token')}</span>
+                      <code
+                        className="min-w-0 truncate rounded border border-slate-100 bg-slate-50 px-2 py-1 font-mono text-sm text-slate-700"
+                        title={showLocalToken ? localConfig?.peerToken || '' : t('collab_token_hidden')}
+                      >
+                        {showLocalToken ? localConfig?.peerToken || '-' : localConfig?.peerToken ? '••••••••••••••••••••' : '-'}
+                      </code>
+                      <div className="flex flex-wrap justify-start gap-1.5 sm:justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setShowLocalToken((current) => !current)}
+                          disabled={!localConfig?.peerToken}
+                          className="rounded border border-slate-200 px-2.5 py-1.5 text-xs font-bold text-slate-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {showLocalToken ? t('collab_hide_token') : t('collab_show_token')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => copyLocalValue('token', localConfig?.peerToken)}
+                          disabled={!localConfig?.peerToken}
+                          className="inline-flex items-center gap-1.5 rounded border border-slate-200 px-2.5 py-1.5 text-xs font-bold text-slate-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {copiedLocalField === 'token' ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                          {copiedLocalField === 'token' ? t('collab_copied') : t('btn_copy_value')}
+                        </button>
+                        <button
+                          type="button"
+                          title={t('collab_refresh_local_token')}
+                          onClick={onRefreshLocalPeerToken}
+                          disabled={isRefreshingLocalToken}
+                          className="inline-flex items-center gap-1.5 rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-xs font-bold text-amber-700 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          <RotateCcw className={cn('h-3.5 w-3.5', isRefreshingLocalToken && 'animate-spin')} />
+                          {t('collab_reset_token')}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
-            <span className="inline-flex w-fit items-center gap-2 rounded-full border border-emerald-100 bg-emerald-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-emerald-600">
-              <span className="h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]"></span>
-              {localConfig?.lanDiscoveryEnabled ? t('collab_discovering') : t('collab_disabled')}
-            </span>
           </section>
 
           <div className="grid grid-cols-1 items-start gap-6 md:grid-cols-[280px_1fr]">
             <aside className="space-y-4">
-              <h3 className="flex items-center gap-2 px-1 text-sm font-bold uppercase tracking-wider text-slate-400">
-                <Users className="h-4 w-4" />
-                {t('collab_peers')}
-              </h3>
+              <div className="flex items-center justify-between gap-3 px-1">
+                <h3 className="flex items-center gap-2 text-sm font-bold uppercase tracking-wider text-slate-400">
+                  <Users className="h-4 w-4" />
+                  {t('collab_peers')}
+                </h3>
+                <button
+                  type="button"
+                  onClick={openManualPairing}
+                  className="inline-flex items-center gap-1.5 rounded border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-bold text-slate-600 shadow-sm transition-colors hover:border-blue-300 hover:text-blue-600"
+                >
+                  <KeyRound className="h-3.5 w-3.5" />
+                  {t('collab_manual_pairing')}
+                </button>
+              </div>
               <div className="space-y-3">
                 {peerCards.map((card) => {
                   const isSelected = card.kind === 'paired' ? selectedPeerId === card.id : peerBaseUrl === card.baseUrl;
                   const projectCount = card.kind === 'paired' && card.id === selectedPeerId ? peerProjects.length : 0;
                   return (
-                    <button
+                    <div
                       key={`${card.kind}:${card.id}`}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => choosePeer(card)}
-                      onContextMenu={(event) => {
-                        if (card.kind !== 'paired') return;
-                        event.preventDefault();
-                        openTokenEditor(card.id);
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          choosePeer(card);
+                        }
                       }}
                       className={cn(
-                        'w-full rounded-xl border bg-white p-4 text-left shadow-sm transition-all',
+                        'w-full cursor-pointer rounded-xl border bg-white p-4 text-left shadow-sm outline-none transition-all focus:ring-2 focus:ring-blue-200',
                         !card.online && 'bg-slate-50 opacity-75',
                         isSelected ? 'border-blue-500 bg-blue-50/10 ring-1 ring-blue-500' : 'border-slate-200 hover:border-blue-300 hover:bg-slate-50'
                       )}
@@ -407,22 +534,53 @@ export function CollaborationPanel({
                           ></span>
                           <span className={cn('truncate', !card.online && 'text-slate-500')}>{card.label}</span>
                         </h4>
-                        <span
-                          className={cn(
-                            'flex-shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider',
-                            !card.online
-                              ? 'bg-slate-100 text-slate-500'
+                        <div className="flex flex-shrink-0 items-center gap-1.5">
+                          <span
+                            className={cn(
+                              'rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider',
+                              !card.online
+                                ? 'bg-slate-100 text-slate-500'
+                                : card.kind === 'paired'
+                                  ? 'bg-blue-50 text-blue-600'
+                                  : 'bg-slate-100 text-slate-500'
+                            )}
+                          >
+                            {!card.online
+                              ? t('collab_status_offline')
                               : card.kind === 'paired'
-                                ? 'bg-blue-50 text-blue-600'
-                                : 'bg-slate-100 text-slate-500'
+                                ? t('collab_status_paired')
+                                : t('collab_status_discovered')}
+                          </span>
+                          {card.kind === 'paired' && (
+                            <>
+                              <button
+                                type="button"
+                                title={t('collab_edit_peer_connection')}
+                                aria-label={t('collab_edit_peer_connection')}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openConnectionEditor(card.id);
+                                }}
+                                className="rounded border border-slate-200 bg-white p-1 text-slate-400 transition-colors hover:border-blue-300 hover:text-blue-600"
+                              >
+                                <Settings className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                title={t('collab_delete_peer')}
+                                aria-label={t('collab_delete_peer')}
+                                disabled={isDeletingPeer}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  requestDeletePeer(card.id);
+                                }}
+                                className="rounded border border-slate-200 bg-white p-1 text-slate-400 transition-colors hover:border-red-300 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </>
                           )}
-                        >
-                          {!card.online
-                            ? t('collab_status_offline')
-                            : card.kind === 'paired'
-                              ? t('collab_status_paired')
-                              : t('collab_status_discovered')}
-                        </span>
+                        </div>
                       </div>
                       <p className="truncate font-mono text-xs text-slate-500">{card.baseUrl || '-'}</p>
                       {card.kind === 'paired' && (
@@ -432,7 +590,37 @@ export function CollaborationPanel({
                             : t('collab_exposed_project_count', { count: projectCount })}
                         </p>
                       )}
-                    </button>
+                      {card.kind === 'paired' && deleteConfirmPeerId === card.id && (
+                        <div
+                          className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <p className="text-xs font-medium leading-5 text-red-700">
+                            {t('collab_delete_peer_confirm', { name: card.label })}
+                          </p>
+                          <div className="mt-3 flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              disabled={isDeletingPeer}
+                              onClick={() => setDeleteConfirmPeerId(null)}
+                              className="rounded border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {t('btn_cancel')}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isDeletingPeer}
+                              onClick={() => {
+                                void confirmDeletePeer(card.id);
+                              }}
+                              className="rounded border border-red-500 bg-red-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:border-red-600 hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {t('collab_delete_peer')}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
                 {peerCards.length === 0 && (
@@ -697,14 +885,14 @@ export function CollaborationPanel({
                     )}
                   </div>
                 </div>
-              ) : !selectedPeer && !peerBaseUrl.trim() ? (
+              ) : !showPairingPanel && !peerBaseUrl.trim() ? (
                 <div className="flex h-64 flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-6 text-center text-slate-400">
                   <Wifi className="mb-3 h-10 w-10 opacity-20" />
                   <p className="text-sm font-medium">
                     {peerCards.length > 0 ? t('collab_select_peer') : t('collab_no_peer_cards')}
                   </p>
                 </div>
-              ) : !selectedPeer ? (
+              ) : showPairingPanel ? (
                 <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white p-10 text-center shadow-sm">
                   <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full border border-blue-100 bg-blue-50">
                     <ShieldCheck className="h-6 w-6 text-blue-500" />
@@ -859,44 +1047,71 @@ export function CollaborationPanel({
           </div>
         </div>
       </div>
-      {tokenEditorPeerId && (
+      {connectionEditorPeerId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/30 p-4">
-          <div className="w-full max-w-sm rounded-lg border border-slate-200 bg-white p-4 shadow-xl">
-            <div className="mb-3 flex items-center gap-2 text-sm font-bold text-slate-800">
-              <KeyRound className="h-4 w-4 text-blue-500" />
-              {t('collab_configure_peer_token')}
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl">
+            <div className="mb-4 flex items-center gap-2 text-sm font-bold text-slate-800">
+              <Settings className="h-4 w-4 text-blue-500" />
+              {t('collab_edit_peer_connection')}
             </div>
-            <input
-              type="text"
-              autoFocus
-              value={tokenEditorDraft}
-              onChange={(event) => setTokenEditorDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  void savePeerToken();
-                }
-                if (event.key === 'Escape') {
-                  closeTokenEditor();
-                }
-              }}
-              placeholder={t('collab_pairing_placeholder')}
-              className="mb-4 w-full rounded border border-slate-300 px-3 py-2 font-mono text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            />
+            <div className="mb-4 space-y-3">
+              <label className="block">
+                <span className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-400">
+                  {t('collab_peer_address')}
+                </span>
+                <input
+                  type="text"
+                  autoFocus
+                  value={connectionEditorBaseUrl}
+                  onChange={(event) => setConnectionEditorBaseUrl(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      void savePeerConnection();
+                    }
+                    if (event.key === 'Escape') {
+                      closeConnectionEditor();
+                    }
+                  }}
+                  placeholder={t('collab_peer_address_placeholder')}
+                  className="w-full rounded border border-slate-300 px-3 py-2 font-mono text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-400">
+                  {t('collab_peer_token')}
+                </span>
+                <input
+                  type="text"
+                  value={connectionEditorToken}
+                  onChange={(event) => setConnectionEditorToken(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      void savePeerConnection();
+                    }
+                    if (event.key === 'Escape') {
+                      closeConnectionEditor();
+                    }
+                  }}
+                  placeholder={t('collab_peer_token_keep_placeholder')}
+                  className="w-full rounded border border-slate-300 px-3 py-2 font-mono text-sm outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                />
+              </label>
+            </div>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={closeTokenEditor}
+                onClick={closeConnectionEditor}
                 className="rounded border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-50"
               >
                 {t('btn_cancel')}
               </button>
               <button
                 type="button"
-                onClick={() => void savePeerToken()}
-                disabled={!tokenEditorDraft.trim() || isUpdatingPeerToken}
+                onClick={() => void savePeerConnection()}
+                disabled={!connectionEditorBaseUrl.trim() || isUpdatingPeerToken}
                 className="inline-flex items-center gap-2 rounded bg-blue-600 px-3 py-2 text-sm font-bold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
               >
-                <KeyRound className="h-4 w-4" />
+                <Check className="h-4 w-4" />
                 {isUpdatingPeerToken ? t('collab_saving_peer_token') : t('btn_save')}
               </button>
             </div>
